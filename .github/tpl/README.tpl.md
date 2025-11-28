@@ -5,7 +5,7 @@
 Latest: {{LATEST_TAG}}
 
 
-The image builder for `{{VM_OS_NAME}}``
+The image builder for `{{VM_OS_NAME}}`
 
 
 How to use:
