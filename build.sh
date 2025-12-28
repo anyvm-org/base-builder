@@ -86,7 +86,7 @@ fi
 if [ "$VM_ISO_LINK" ]; then
   #start from iso, install to the vir disk
 
-  $vmsh createVM  $VM_ISO_LINK $osname $ostype $sshport
+  $vmsh createVM  "$VM_ISO_LINK" "$osname" "$ostype" "$sshport" "$VM_PRE_DISK_LINK"
 
   sleep 2
 
@@ -182,7 +182,9 @@ start_and_wait() {
 }
 
 shutdown_and_wait() {
-  ssh $osname  "$VM_SHUTDOWN_CMD"
+  if ! ssh -o ConnectTimeout=5 -o ServerAliveInterval=2 $osname  "$VM_SHUTDOWN_CMD"; then
+    echo "shutdown $?, haiku? but we just ignore it."
+  fi
 
   sleep 30
 
@@ -247,8 +249,10 @@ echo >>enablessh.local
 
 cat enablessh.local
 
-
-if [ "$VM_USE_SSHROOT_BUILD_SSH" ]; then
+if [ -e "hooks/enablessh.sh" ]; then
+    cat "hooks/enablessh.sh"
+    . "hooks/enablessh.sh"
+elif [ "$VM_USE_SSHROOT_BUILD_SSH" ]; then
   vmip=$($vmsh getVMIP $osname)
   sshpass -p "$VM_ROOT_PASSWORD" ssh -o StrictHostKeyChecking=no -tt  root@$vmip TERM=xterm <enablessh.local
   #sleep for the sshd server to restart
