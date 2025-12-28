@@ -397,6 +397,7 @@ fi
 ssh $osname 'cat ~/.ssh/id_rsa.pub' >$output-id_rsa.pub
 
 
+if [ -z "$VM_NO_REBOOT_CRONTAB" ]; then
 
 #upload reboot.sh
 if [ -e "hooks/reboot.sh" ]; then
@@ -440,6 +441,10 @@ fi
 crontab -l
 
 EOF
+
+#VM_NO_REBOOT_CRONTAB
+
+fi
 
 
 # Install any requested packages
