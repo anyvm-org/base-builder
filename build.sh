@@ -498,7 +498,14 @@ if [ -z "$VM_RSYNC_PKG$VM_SSHFS_PKG" ]; then
 else
   $vmsh addSSHAuthorizedKeys $output-id_rsa.pub
   $vmsh startVM $osname
-  $vmsh waitForVMReady $osname
+  if [ -z "$VM_NO_REBOOT_CRONTAB" ]; then
+    $vmsh waitForVMReady $osname
+  else
+    while ! timeout 5 ssh $osname exit; do
+      echo not ready yet, just sleep.
+      sleep 5
+    done
+  fi
   #these packages should also be installed before.
   #so remove the following code, since openIndiana returns error 4 if sshfs is already installed.
   #if [ "$VM_RSYNC_PKG" ]; then
@@ -533,9 +540,15 @@ else
     ssh $osname cat /etc/ssh/sshd_config
     exit 1
   fi
-  #check if the /home dir is writable
-  ssh $osname mkdir -p $HOME/work
-  ssh $osname ls -lah $HOME
+  if [ "$osname" = "haiku" ]; then
+   #it's /boot/home
+   ssh $osname mkdir -p '$HOME/work'
+   ssh $osname ls -lah '$HOME'
+  else
+   #check if the /home dir is writable
+   ssh $osname mkdir -p $HOME/work
+   ssh $osname ls -lah $HOME
+  fi
 fi
 
 echo "Build finished."
