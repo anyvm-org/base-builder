@@ -549,6 +549,9 @@ else
    ssh $osname mkdir -p $HOME/work
    ssh $osname ls -lah $HOME
   fi
+  echo "======Show ssh config: "
+  ssh $osname cat /etc/ssh/sshd_config
+  
 fi
 
 echo "Build finished."
