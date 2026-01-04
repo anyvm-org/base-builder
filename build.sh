@@ -397,7 +397,7 @@ fi
 ssh $osname 'cat ~/.ssh/id_rsa.pub' >$output-id_rsa.pub
 
 
-if [ -z "$VM_NO_REBOOT_CRONTAB" ]; then
+if [ "$VM_ENABLE_REBOOT_CRONTAB" ]; then
 
 #upload reboot.sh
 if [ -e "hooks/reboot.sh" ]; then
@@ -442,7 +442,7 @@ crontab -l
 
 EOF
 
-#VM_NO_REBOOT_CRONTAB
+#VM_ENABLE_REBOOT_CRONTAB
 
 fi
 
@@ -498,7 +498,7 @@ if [ -z "$VM_RSYNC_PKG$VM_SSHFS_PKG" ]; then
 else
   $vmsh addSSHAuthorizedKeys $output-id_rsa.pub
   $vmsh startVM $osname
-  if [ -z "$VM_NO_REBOOT_CRONTAB" ]; then
+  if [ "$VM_ENABLE_REBOOT_CRONTAB" ]; then
     $vmsh waitForVMReady $osname
   else
     while ! timeout 5 ssh $osname exit; do
