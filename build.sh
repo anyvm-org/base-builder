@@ -544,13 +544,16 @@ else
    #it's /boot/home
    ssh $osname mkdir -p '$HOME/work'
    ssh $osname ls -lah '$HOME'
+   echo "======Show ssh config: "
+   ssh $osname cat /boot/system/settings/ssh/sshd_config
   else
    #check if the /home dir is writable
    ssh $osname mkdir -p $HOME/work
    ssh $osname ls -lah $HOME
+   echo "======Show ssh config: "
+   ssh $osname cat /etc/ssh/sshd_config
   fi
-  echo "======Show ssh config: "
-  ssh $osname cat /etc/ssh/sshd_config
+  
   
 fi
 
