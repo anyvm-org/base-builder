@@ -460,6 +460,17 @@ if [ -e "hooks/finalize.sh" ]; then
   ssh -o "SendEnv=VM_RELEASE" $osname sh<"hooks/finalize.sh"
 fi
 
+
+#support VM_EXTRA_SCRIPT
+if [ "$VM_EXTRA_SCRIPT" ]; then
+  echo "$VM_EXTRA_SCRIPT"
+  export VM_RELEASE
+  ssh -o "SendEnv=VM_RELEASE" $osname sh<"$VM_EXTRA_SCRIPT"
+fi
+
+
+
+
 # Done!
 shutdown_and_wait
 
