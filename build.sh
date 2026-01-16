@@ -41,7 +41,7 @@ export VM_USE_NC_ENABLE_SSH
 export VM_USE_TELNET_ENABLE_SSH
 export VM_USE_BASH_ENABLE_SSH
 export VM_NIC
-
+export VM_EXTRA_SCRIPT
 
 ##############################################################
 
