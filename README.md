@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/anyvm-org/-builder/actions/workflows/build.yml/badge.svg)](https://github.com/anyvm-org/-builder/actions/workflows/build.yml)
 
-Latest: 
+Latest: 0.0.0
 
 
 The image builder for ``
