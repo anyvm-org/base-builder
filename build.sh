@@ -518,7 +518,14 @@ ls -lah
 # Standalone verification: boot the EXPORTED qcow2 in a fresh QEMU instance
 # (no libvirt domain, no install ISO) and verify SSH actually answers.
 # Catches "install silently failed and exported an empty qcow2" failure mode.
+#
+# This block uses qemu-system-x86_64 + KVM + `-cpu host`, so it's only
+# meaningful when the guest is x86_64. For other arches (aarch64,
+# riscv64, sparc64, ...) skip and rely on the existing post-export
+# libvirt-based check below.
 ##############################################################
+
+if [ -z "${VM_ARCH}" ] || [ "${VM_ARCH}" = "x86_64" ]; then
 
 _sudo_vir=""
 uname -a | grep -i Linux >/dev/null && _sudo_vir=sudo
@@ -606,6 +613,10 @@ if [ "$_verify_ok" != "1" ]; then
   exit 1
 fi
 echo "Exported qcow2 verified: SSH is reachable."
+
+else
+  echo "Skipping standalone qcow2 verification (VM_ARCH=$VM_ARCH; x86_64-only path)"
+fi
 
 ##############################################################
 
