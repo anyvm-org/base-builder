@@ -121,6 +121,20 @@ if [ "$VM_ISO_LINK" ]; then
 
   if [[ "$VM_ISO_LINK" == *"img" ]]; then
     $vmsh detachIMG "$osname"
+  else
+    # Detach the install ISO so post-install boot can only use the installed disk.
+    # Without this, BIOS falls back to CDROM when the install actually failed,
+    # the live ISO's sshd answers, and the build script believes everything is
+    # fine -- producing an empty exported qcow2.
+    _sudo_vir=""
+    uname -a | grep -i Linux >/dev/null && _sudo_vir=sudo
+    _cdrom_targets=$($_sudo_vir virsh domblklist "$osname" --details 2>/dev/null \
+        | awk '$2 == "cdrom" { print $3 }')
+    for _t in $_cdrom_targets; do
+      echo "Detaching install CDROM target=$_t from $osname"
+      $_sudo_vir virsh change-media "$osname" "$_t" --eject --config 2>/dev/null || true
+      $_sudo_vir virsh detach-disk "$osname" "$_t" --persistent --config 2>/dev/null || true
+    done
   fi
 
 elif [ "$VM_VHD_LINK" ]; then
@@ -499,6 +513,99 @@ cp ~/.ssh/id_rsa  $output-host.id_rsa
 echo "contents after export:"
 ls -lah
 
+
+##############################################################
+# Standalone verification: boot the EXPORTED qcow2 in a fresh QEMU instance
+# (no libvirt domain, no install ISO) and verify SSH actually answers.
+# Catches "install silently failed and exported an empty qcow2" failure mode.
+##############################################################
+
+_sudo_vir=""
+uname -a | grep -i Linux >/dev/null && _sudo_vir=sudo
+_verify_port=2230
+_verify_serial="/tmp/${osname}-verify.serial.log"
+_verify_pidfile="/tmp/${osname}-verify.pid"
+rm -f "$_verify_serial" "$_verify_pidfile"
+
+_disk_args=""
+case "${VM_DISK:-virtio}" in
+  sata)
+    _disk_args="-drive file=$ova,if=none,id=disk0,format=qcow2,snapshot=on \
+                -device ahci,id=ahci0 \
+                -device ide-hd,drive=disk0,bus=ahci0.0"
+    ;;
+  ide)
+    _disk_args="-drive file=$ova,if=ide,format=qcow2,snapshot=on"
+    ;;
+  *)
+    _disk_args="-drive file=$ova,if=virtio,format=qcow2,snapshot=on"
+    ;;
+esac
+
+echo "============================================================"
+echo "Verifying exported qcow2 boots standalone (no ISO attached)"
+echo "============================================================"
+$_sudo_vir qemu-system-x86_64 \
+  -enable-kvm \
+  -machine pc \
+  -cpu host \
+  -m 4096 \
+  -smp 2 \
+  $_disk_args \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:${_verify_port}-:22 \
+  -device "${VM_NIC:-e1000},netdev=net0" \
+  -display none \
+  -serial "file:$_verify_serial" \
+  -pidfile "$_verify_pidfile" \
+  -daemonize
+
+# Give QEMU a moment to write its pidfile.
+sleep 2
+_verify_pid=""
+[ -s "$_verify_pidfile" ] && _verify_pid=$(cat "$_verify_pidfile" 2>/dev/null)
+if [ -z "$_verify_pid" ] || [ ! -d "/proc/$_verify_pid" ]; then
+  echo "ERROR: verify QEMU did not start (pidfile=$_verify_pidfile)"
+  cat "$_verify_serial" 2>/dev/null | tail -50
+  exit 1
+fi
+
+echo "Waiting up to 10 minutes for SSH on port $_verify_port (verify pid=$_verify_pid)..."
+_verify_ok=0
+for i in $(seq 1 120); do
+  if [ ! -d "/proc/$_verify_pid" ]; then
+    echo "ERROR: verify QEMU died unexpectedly (after $((i * 5))s)"
+    break
+  fi
+  if timeout 3 ssh -o StrictHostKeyChecking=no \
+       -o UserKnownHostsFile=/dev/null \
+       -o LogLevel=ERROR \
+       -i "$output-host.id_rsa" \
+       -p "$_verify_port" \
+       root@127.0.0.1 'echo VERIFY_OK; uname -a' 2>/dev/null \
+     | grep -q VERIFY_OK; then
+    _verify_ok=1
+    break
+  fi
+  sleep 5
+done
+
+# Stop verify VM
+$_sudo_vir kill "$_verify_pid" 2>/dev/null || true
+for i in 1 2 3 4 5; do
+  [ -d "/proc/$_verify_pid" ] || break
+  sleep 1
+done
+$_sudo_vir kill -9 "$_verify_pid" 2>/dev/null || true
+
+if [ "$_verify_ok" != "1" ]; then
+  echo "ERROR: exported qcow2 did NOT come up to SSH in 5 minutes."
+  echo "=== last 200 lines of verify serial log ==="
+  tail -200 "$_verify_serial" 2>/dev/null || echo "(no serial log)"
+  echo "=== exported qcow2 info ==="
+  qemu-img info "$ova" 2>/dev/null
+  exit 1
+fi
+echo "Exported qcow2 verified: SSH is reachable."
 
 ##############################################################
 
