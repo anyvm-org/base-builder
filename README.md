@@ -1,7 +1,7 @@
 
 
 [![Build](https://github.com/anyvm-org/-builder/actions/workflows/build.yml/badge.svg)](https://github.com/anyvm-org/-builder/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/-builder?include_prereleases&sort=semver&display_name=tag)](https://github.com/-builder/releases)
+[![Release](https://img.shields.io/github/v/release/anyvm-org/-builder?include_prereleases&sort=semver&display_name=tag)](https://github.com/anyvm-org/-builder/releases)
 
 Latest: 0.0.0
 
