@@ -540,6 +540,17 @@ fi
 # Done!
 shutdown_and_wait
 
+# Host-side image-finalize hook. Runs AFTER the build VM has shut down (so the
+# qcow2 is the final disk) but BEFORE the ISO is removed below -- the hook may
+# need the ISO (e.g. to boot it as a helper VM and post-process the image, since
+# the Linux build host usually cannot mount the guest's filesystem directly).
+# No-op for builders that do not provide it.
+if [ -e "hooks/finalizeImage.sh" ]; then
+  echo "hooks/finalizeImage.sh"
+  cat "hooks/finalizeImage.sh"
+  . "hooks/finalizeImage.sh"
+fi
+
 ##############################################################
 
 if [ "$VM_ISO_LINK" ]; then
