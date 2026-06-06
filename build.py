@@ -1913,27 +1913,49 @@ def conf_load(path):
 # ============================================================================
 
 def _ssh_ready_check(timeout=10):
-    """Return True if `ssh $VM_OS_NAME exit` succeeds within `timeout` seconds.
-    Uses subprocess.run(timeout=...) instead of the external `timeout` binary;
-    on TimeoutExpired the child is killed and we return False.
+    """Probe `ssh $VM_OS_NAME exit` with `-v` so the caller can inspect why
+    the connection failed (auth refused, no route, perm denied, banner
+    timeout). Returns (success, stderr_text). stderr_text is empty on success
+    and on TimeoutExpired (the verbose dump up to the kill point isn't useful
+    when ssh hung mid-handshake).
 
     Default 10 s -- short enough that retry polling stays snappy, long enough
     to cover SSH banner + key exchange + auth on slow guests (illumos sshd
     in particular takes 4-5 s for the full handshake even on a healthy KVM
     boot; an over-tight 2 s window misreads a working sshd as down)."""
     osname = env("VM_OS_NAME")
-    if not osname: return False
-    cmd = ["ssh",
+    if not osname:
+        return False, ""
+    # -v gives the line we actually want to see ("Permission denied
+    # (publickey)", "Connection refused", "ssh: connect to host ... port
+    # 22: No route to host"). LogLevel=ERROR would mute -v -- drop it.
+    cmd = ["ssh", "-v",
            "-o", "StrictHostKeyChecking=no",
            "-o", "UserKnownHostsFile=/dev/null",
-           "-o", "LogLevel=ERROR",
            "-o", "ConnectTimeout=%d" % max(1, int(timeout)),
            osname, "exit"]
     try:
-        return subprocess.run(cmd, stdout=DEVNULL, stderr=DEVNULL,
-                              timeout=timeout).returncode == 0
+        r = subprocess.run(cmd, stdout=DEVNULL, stderr=subprocess.PIPE,
+                           timeout=timeout)
     except subprocess.TimeoutExpired:
-        return False
+        return False, ""
+    ok = (r.returncode == 0)
+    err = "" if ok else (r.stderr or b"").decode("utf-8", "replace")
+    return ok, err
+
+
+def _ssh_verbose_summary(stderr_text, head=20, tail=10):
+    """Trim ssh -v output to the lines most likely to identify the failure.
+
+    Full -v dump per retry is too noisy (~50 lines * many retries = thousands
+    of lines in CI logs). Show the connect / handshake header and the tail
+    where the actual auth/refusal lines live."""
+    if not stderr_text:
+        return ""
+    lines = [ln for ln in stderr_text.splitlines() if ln.strip()]
+    if len(lines) <= head + tail:
+        return "\n".join(lines)
+    return "\n".join(lines[:head] + ["    ... (%d lines trimmed) ..." % (len(lines) - head - tail)] + lines[-tail:])
 
 
 def _wait_ssh(max_retries=100, restart_cb=None):
@@ -1961,8 +1983,23 @@ def _wait_ssh(max_retries=100, restart_cb=None):
     retry = 0
     restarted = False
     guard_done = False
-    while not _ssh_ready_check(10):
-        log("ssh is not ready, just wait.")
+    # Dump ssh -v output every Nth failed retry so we can see WHY ssh
+    # failed (auth denied, refused, etc.) without flooding the build log.
+    VERBOSE_EVERY = 5
+    while True:
+        ok, err = _ssh_ready_check(10)
+        if ok:
+            break
+        # First failure and every Nth retry: log the trimmed -v output so
+        # the failure reason is visible in CI logs.
+        if retry == 0 or (retry % VERBOSE_EVERY) == 0:
+            summary = _ssh_verbose_summary(err)
+            if summary:
+                log("ssh probe %d (-v summary):\n%s" % (retry, summary))
+            else:
+                log("ssh probe %d: connection timeout (no verbose output)" % retry)
+        else:
+            log("ssh is not ready, just wait.")
         if not guard_done:
             actual = detect_guest_ip(osname)
             if actual:
@@ -2066,7 +2103,13 @@ def _prep_vhd_disk(link):
 def _gen_enablessh_local():
     """Build enablessh.local: enablessh.txt + authorized_keys append (twice,
     once base64-roundtripped to dodge encoding bugs we've seen in console
-    paste paths) + chmod."""
+    paste paths) + chmod.
+
+    Final block enforces correct .ssh permissions in case the per-builder
+    enablessh.txt clobbered them (e.g. a `chmod -R 600 ~/.ssh` line that
+    leaves the *directory* at mode 600, which sshd-StrictModes refuses to
+    traverse -- causing every pubkey login to bounce to PAM and burn auth
+    attempts, ending in "maximum authentication attempts exceeded")."""
     idrsa = os.path.join(HOME, ".ssh", "id_rsa")
     if not os.path.exists(idrsa):
         run(["ssh-keygen", "-f", idrsa, "-q", "-N", ""])
@@ -2081,7 +2124,20 @@ def _gen_enablessh_local():
         b64 = base64.b64encode(pub.encode("utf-8")).decode("ascii")
         f.write("echo '%s' | openssl base64 -d >>~/.ssh/authorized_keys\n\n\n"
                 % b64)
-        f.write("\nchmod 600 ~/.ssh/authorized_keys\n\n\n")
+        # sshd StrictModes (default) requires .ssh dir 700 + authorized_keys
+        # 600. Set both explicitly -- belt-and-suspenders against a buggy
+        # `chmod -R 600` in the per-builder enablessh.txt.
+        f.write("\nchmod 700 ~/.ssh\n")
+        f.write("chmod 600 ~/.ssh/authorized_keys\n\n")
+        # Force StrictModes off so any remaining permission anomaly (parent
+        # dir mode, immutable flag, weird umask in the live image) can no
+        # longer block pubkey auth. Idempotent: only appends when the line
+        # isn't already there. The `service sshd restart` line from the
+        # per-builder enablessh.txt picks the new config up.
+        f.write("chmod u+w /etc/ssh/sshd_config 2>/dev/null || true\n")
+        f.write("grep -q '^StrictModes no' /etc/ssh/sshd_config || "
+                "echo 'StrictModes no' >> /etc/ssh/sshd_config\n")
+        f.write("chmod u-w /etc/ssh/sshd_config 2>/dev/null || true\n\n\n")
     log(open("enablessh.local").read())
 
 
@@ -2304,7 +2360,10 @@ def main(argv):
     else:
         addSSHAuthorizedKeys("%s-id_rsa.pub" % output)
         startVM()
-        while not _ssh_ready_check(timeout=10):
+        while True:
+            ok, _err = _ssh_ready_check(timeout=10)
+            if ok:
+                break
             log("not ready yet, just sleep."); time.sleep(5)
         if not _send_env_check():
             return 1
