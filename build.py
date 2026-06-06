@@ -176,10 +176,13 @@ def tail_file(path, n):
 # (B) QEMU HMP monitor over TCP (was vbox.py:qmon)
 # ============================================================================
 
-def qmon(osname, command, timeout=2.0):
+def qmon(command, timeout=2.0):
     """Send one HMP command, return reply text or None. Ported from
     anyvm.py:_qmon_send. Never send 'quit' -- it terminates QEMU; we close the
     socket from our side and the server,nowait monitor keeps listening."""
+    osname = env("VM_OS_NAME")
+    if not osname:
+        return None
     port = read_state(osname, "monport")
     if not port:
         return None
@@ -329,8 +332,9 @@ AARCH64_EFI_CANDIDATES = [
 ]
 
 
-def build_qemu_args(osname, media_kind=None, media_path=None):
+def build_qemu_args(media_kind=None, media_path=None):
     """Build the full QEMU argv. media_kind is None / 'cdrom' / 'disk'."""
+    osname = env("VM_OS_NAME")
     arch = env("VM_ARCH") or "x86_64"
     qcow = "%s.qcow2" % osname
     sshport = read_state(osname, "sshport") or "22"
@@ -434,10 +438,11 @@ def build_qemu_args(osname, media_kind=None, media_path=None):
     return a
 
 
-def launch_qemu(osname, media_kind=None, media_path=None):
+def launch_qemu(media_kind=None, media_path=None):
     """Launch QEMU detached so it survives this Python process."""
+    osname = env("VM_OS_NAME")
     qbin = resolve_qemu_bin()
-    cmd = [qbin] + build_qemu_args(osname, media_kind, media_path)
+    cmd = [qbin] + build_qemu_args(media_kind, media_path)
     with open(state(osname, "cmdline"), "w") as f:
         f.write(" ".join(cmd) + "\n")
     log("Launching QEMU for %s:" % osname)
@@ -605,14 +610,13 @@ class ConsoleSession(object):
     fills up and the guest console eventually blocks. The drain thread reads
     and discards."""
 
-    def __init__(self, osname, serport):
-        self.osname = osname
+    def __init__(self, serport):
         self.ser = socket.create_connection(("127.0.0.1", serport), timeout=5.0)
         self.ser.settimeout(1.0)
         self._stop = threading.Event()
         self._send_lock = threading.Lock()
         self._t = threading.Thread(target=self._drain, daemon=True,
-                                   name="console-drain-%s" % osname)
+                                   name="console-drain-%s" % (env("VM_OS_NAME") or "vm"))
         self._t.start()
 
     def _drain(self):
@@ -651,8 +655,10 @@ class ConsoleSession(object):
         self._t.join(timeout=2.0)
 
 
-def _send_console(osname, s):
+def _send_console(s):
     """Inject bytes into the guest's console (console-build mode only)."""
+    osname = env("VM_OS_NAME")
+    if not osname: return
     with _console_sessions_lock:
         sess = _console_sessions.get(osname)
     if sess:
@@ -671,7 +677,7 @@ def openConsole():
         except ValueError:
             log("openConsole: no serport for %s" % osname); return 1
         try:
-            sess = ConsoleSession(osname, serport)
+            sess = ConsoleSession(serport)
         except OSError as e:
             log("openConsole: cannot connect to serial 127.0.0.1:%d (%s)" % (serport, e))
             return 1
@@ -764,8 +770,8 @@ def createVM(isolink=None, ostype=None, sshport=None, disklink=None):
     except OSError: pass
     write_state(osname, "sshport", sshport or "22")
     if iso.endswith("img"):
-        return launch_qemu(osname, "disk", iso)
-    return launch_qemu(osname, "cdrom", iso)
+        return launch_qemu("disk", iso)
+    return launch_qemu("cdrom", iso)
 
 
 def createVMFromVHD(ostype=None, sshport=None):
@@ -780,15 +786,13 @@ def createVMFromVHD(ostype=None, sshport=None):
 
 
 def startVM():
-    osname = _check_osname("startVM")
-    if not osname: return 1
-    return launch_qemu(osname)
+    if not _check_osname("startVM"): return 1
+    return launch_qemu()
 
 
 def shutdownVM():
-    osname = _check_osname("shutdownVM")
-    if not osname: return 1
-    qmon(osname, "system_powerdown")
+    if not _check_osname("shutdownVM"): return 1
+    qmon("system_powerdown")
     time.sleep(2)
     return 0
 
@@ -824,10 +828,12 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
-def _serial_tail_line(osname, window=4096):
-    """Return the last non-empty line of the QEMU serial log (with ANSI escape
-    sequences and control bytes stripped). Used to show what the guest is
-    actually doing during long waits."""
+def _serial_tail_line(window=4096):
+    """Return (size, last_line) of the QEMU serial log: total bytes plus the
+    last non-empty line (ANSI escape sequences and control bytes stripped).
+    Used to show what the guest is actually doing during long waits."""
+    osname = env("VM_OS_NAME")
+    if not osname: return 0, ""
     path = "%s.serial.log" % osname
     try:
         size = os.path.getsize(path)
@@ -848,11 +854,12 @@ def _serial_tail_line(osname, window=4096):
     return size, last
 
 
-def _wait_vm_down(osname, what="VM", poll=20):
-    """Block until isRunning(osname) reports not-running. Every poll prints a
-    one-line status: elapsed time, size of <osname>.serial.log, and the last
-    non-empty line of the guest console -- so it's obvious whether the install
-    is making progress or stuck."""
+def _wait_vm_down(what="VM", poll=20):
+    """Block until isRunning() reports not-running. Every poll prints a one-
+    line status: elapsed time, size of <osname>.serial.log, and the last non-
+    empty line of the guest console -- so it's obvious whether the install is
+    making progress or stuck."""
+    osname = env("VM_OS_NAME") or "vm"
     monport = read_state(osname, "monport")
     serport = read_state(osname, "serport")
     log("waiting for %s to power off (poll %ds; vnc 127.0.0.1:0, "
@@ -862,7 +869,7 @@ def _wait_vm_down(osname, what="VM", poll=20):
     while isRunning() == 0:
         time.sleep(poll)
         elapsed += poll
-        size, tail = _serial_tail_line(osname)
+        size, tail = _serial_tail_line()
         mm, ss = divmod(elapsed, 60)
         log("[%dm%02ds] %s, serial=%dB | %s" % (mm, ss, what, size, tail[:140]))
     log("%s powered off after %d s" % (what, elapsed))
@@ -961,17 +968,18 @@ def vncType(text):
     return subprocess.run(["vncdotool", "--force-caps", "type", text]).returncode
 
 
-def _write_index_html(osname, text):
+def _write_index_html(text):
     head = ("<!DOCTYPE html>\n<html>\n<head>\n<title>%s %s</title>\n"
             "<meta http-equiv='refresh' content='1'>\n</head>\n"
             "<body onclick='stop()' style='background-color:grey;'>\n\n"
             "<img src='screen.png' alt='Screen'>\n\n<br>\n<pre>\n"
-            % (osname, env("VM_RELEASE")))
+            % (env("VM_OS_NAME") or "", env("VM_RELEASE")))
     with open("index.html", "w") as f:
         f.write(head); f.write(text); f.write("</pre></body></html>\n")
 
 
-def _screen_text_value(osname, img=None):
+def _screen_text_value(img=None):
+    osname = env("VM_OS_NAME") or "vm"
     if env("VM_USE_CONSOLE_BUILD"):
         text = tail_file(serial_log(osname), 50)
     else:
@@ -986,30 +994,37 @@ def _screen_text_value(osname, img=None):
     if img:
         with open("screen.txt", "w") as f:
             f.write(text)
-        _write_index_html(osname, text)
+        _write_index_html(text)
     return text
 
 
 def screenText(img=None):
-    osname = _check_osname("screenText")
-    if not osname: return 1
-    text = _screen_text_value(osname, img)
+    if not _check_osname("screenText"): return 1
+    text = _screen_text_value(img)
     if not img:
         sys.stdout.write(text)
     return 0
 
 
+def screenTextValue():
+    """Return the current OCR'd VNC screen (or tail of the serial log in
+    console-build mode) as a string. For hooks doing text matching, e.g.
+        while "Welcome to ..." not in screenTextValue(): vncKey("super-alt-t")
+    osname comes from VM_OS_NAME just like all the other hook-facing helpers."""
+    if not _check_osname("screenTextValue"): return ""
+    return _screen_text_value()
+
+
 def waitForText(text=None, sec="", hook=None):
     if not text:
         log("Usage: waitForText text [sec]"); return 1
-    osname = _check_osname("waitForText")
-    if not osname: return 1
+    if not _check_osname("waitForText"): return 1
     sec = (str(sec) or "").strip()
     log("Waiting for text: %s" % text)
     t = 0
     while (not sec) or (t < int(sec)):
         time.sleep(3)
-        screen = _screen_text_value(osname, None)
+        screen = _screen_text_value(None)
         with open("_screenText.txt", "w") as f:
             f.write(screen)
         log(""); log("==========screen Text============")
@@ -1050,7 +1065,7 @@ def startWeb(needOCR=None):
         while not _startweb_stop.is_set():
             if not os.path.exists("_stopvnc.txt"):
                 try:
-                    _screen_text_value(osname, "screen.png")
+                    _screen_text_value("screen.png")
                 except Exception:
                     pass
             time.sleep(3)
@@ -1073,9 +1088,7 @@ def getVMIP():
     """Returns the guest's slirp IP from the QEMU monitor; for *logging only*
     under slirp -- the host has no route to the guest's 192.168.122.x. Host->
     guest SSH MUST go through the hostfwd port on 127.0.0.1."""
-    osname = env("VM_OS_NAME")
-    if not osname: return ""
-    return parse_usernet_ip(qmon(osname, "info usernet") or "") or ""
+    return parse_usernet_ip(qmon("info usernet") or "") or ""
 
 
 def addSSHHost(idfile=None, user=None):
@@ -1121,12 +1134,11 @@ def addSSHAuthorizedKeys(pbk=None):
 
 
 def addNAT(proto=None, hostPort=None, vmPort=None):
-    osname = _check_osname("addNAT")
-    if not osname: return 1
+    if not _check_osname("addNAT"): return 1
     if not vmPort:
         log("Usage: addNAT protocol hostPort vmPort"); return 1
-    if qmon(osname, "hostfwd_add %s:127.0.0.1:%s-:%s" % (proto, hostPort, vmPort)) is None:
-        log("addNAT: monitor not available for %s" % osname); return 1
+    if qmon("hostfwd_add %s:127.0.0.1:%s-:%s" % (proto, hostPort, vmPort)) is None:
+        log("addNAT: monitor not available"); return 1
     return 0
 
 
@@ -1158,9 +1170,9 @@ def exportOVA(ova=None, xml=None):
 # (J) Key / text injection
 # ============================================================================
 
-def _key(osname, console_seq, vnc_key):
+def _key(console_seq, vnc_key):
     if env("VM_USE_CONSOLE_BUILD"):
-        _send_console(osname, console_seq)
+        _send_console(console_seq)
     else:
         run(["vncdotool", "key", vnc_key])
 
@@ -1177,12 +1189,11 @@ def string(*args):
     Do NOT pass osname as a leading arg. The old API accepted it and that
     accidentally produced `# midnightbsd dhclient vtnet0` (root cause of the
     initial MidnightBSD runs hanging at /bin/sh: midnightbsd: not found)."""
-    osname = env("VM_OS_NAME")
-    if not osname:
+    if not env("VM_OS_NAME"):
         log("string: VM_OS_NAME not set"); return 1
     text = " ".join(args)
     if env("VM_USE_CONSOLE_BUILD"):
-        _send_console(osname, text)
+        _send_console(text)
     else:
         run(["vncdotool", "--force-caps", "type", text])
     return 0
@@ -1196,61 +1207,52 @@ def _check_osname(funcname):
 
 
 def space():
-    osname = _check_osname("space")
-    if not osname: return 1
+    if not _check_osname("space"): return 1
     if env("VM_USE_CONSOLE_BUILD"):
-        _send_console(osname, " ")
+        _send_console(" ")
     else:
         run(["vncdotool", "type", " "])
     return 0
 
 
 def enter():
-    osname = _check_osname("enter")
-    if not osname: return 1
-    _key(osname, "\r", "enter"); return 0
+    if not _check_osname("enter"): return 1
+    _key("\r", "enter"); return 0
 
 
 def tab():
-    osname = _check_osname("tab")
-    if not osname: return 1
-    _key(osname, "\t", "tab"); return 0
+    if not _check_osname("tab"): return 1
+    _key("\t", "tab"); return 0
 
 
 def f2():
-    osname = _check_osname("f2")
-    if not osname: return 1
-    _key(osname, "\x1b[12~", "f2"); return 0
+    if not _check_osname("f2"): return 1
+    _key("\x1b[12~", "f2"); return 0
 
 
 def f7():
-    osname = _check_osname("f7")
-    if not osname: return 1
-    _key(osname, "\x1b[18~", "f7"); return 0
+    if not _check_osname("f7"): return 1
+    _key("\x1b[18~", "f7"); return 0
 
 
 def f8():
-    osname = _check_osname("f8")
-    if not osname: return 1
-    _key(osname, "\x1b[19~", "f8"); return 0
+    if not _check_osname("f8"): return 1
+    _key("\x1b[19~", "f8"); return 0
 
 
 def down():
-    osname = _check_osname("down")
-    if not osname: return 1
-    _key(osname, "\x1b[B", "down"); return 0
+    if not _check_osname("down"): return 1
+    _key("\x1b[B", "down"); return 0
 
 
 def up():
-    osname = _check_osname("up")
-    if not osname: return 1
-    _key(osname, "\x1b[A", "up"); return 0
+    if not _check_osname("up"): return 1
+    _key("\x1b[A", "up"); return 0
 
 
 def ctrlD():
-    osname = _check_osname("ctrlD")
-    if not osname: return 1
-    _key(osname, "\x04", "ctrl-d"); return 0
+    if not _check_osname("ctrlD"): return 1
+    _key("\x04", "ctrl-d"); return 0
 
 
 KEYFUNCS = {
@@ -1518,10 +1520,12 @@ def conf_load(path):
 # (M) Build pipeline (was build.sh)
 # ============================================================================
 
-def _ssh_ready_check(osname, timeout=2):
-    """Return True if `ssh osname exit` succeeds within `timeout` seconds.
+def _ssh_ready_check(timeout=2):
+    """Return True if `ssh $VM_OS_NAME exit` succeeds within `timeout` seconds.
     Uses subprocess.run(timeout=...) instead of the external `timeout` binary;
     on TimeoutExpired the child is killed and we return False."""
+    osname = env("VM_OS_NAME")
+    if not osname: return False
     cmd = ["ssh",
            "-o", "StrictHostKeyChecking=no",
            "-o", "UserKnownHostsFile=/dev/null",
@@ -1535,10 +1539,10 @@ def _ssh_ready_check(osname, timeout=2):
         return False
 
 
-def _wait_ssh(osname, max_retries=100, restart_cb=None):
+def _wait_ssh(max_retries=100, restart_cb=None):
     """Poll ssh until reachable; optional restart_cb runs once on failure."""
     retry = 0; restarted = False
-    while not _ssh_ready_check(osname, 2):
+    while not _ssh_ready_check(2):
         log("ssh is not ready, just wait.")
         time.sleep(10); retry += 1
         if retry > max_retries:
@@ -1570,7 +1574,7 @@ def shutdown_and_wait():
     if isRunning() == 0:
         if shutdownVM() != 0:
             log("shutdown error")
-    _wait_vm_down(osname, what="VM shutdown", poll=5)
+    _wait_vm_down(what="VM shutdown", poll=5)
     closeConsole()
 
 
@@ -1578,8 +1582,9 @@ def restart_and_wait():
     shutdown_and_wait(); start_and_wait()
 
 
-def _prep_vhd_disk(osname, link):
+def _prep_vhd_disk(link):
     """Materialize $osname.qcow2 from a published cloud image URL."""
+    osname = env("VM_OS_NAME")
     qcow = "%s.qcow2" % osname
     if os.path.exists(qcow): return
     if link.endswith("img.gz"):
@@ -1690,8 +1695,9 @@ def _enable_ssh_console_branch():
     inputKeys("enter"); time.sleep(2)
 
 
-def _send_env_check(osname):
+def _send_env_check():
     """sanity-check that ssh SendEnv passes GITHUB_ANYVM through."""
+    osname = env("VM_OS_NAME")
     p = subprocess.run(
         ["ssh", osname, "sh", "-c", "env"], capture_output=True,
         env={**os.environ, "GITHUB_ANYVM": "1"})
@@ -1759,12 +1765,12 @@ def main(argv):
                     log("shutdown error")
                 if destroyVM() != 0:
                     log("destroyVM error")
-        _wait_vm_down(osname, what="install", poll=20)
+        _wait_vm_down(what="install", poll=20)
         closeConsole()
         # No CDROM detach needed: the next startVM relaunches QEMU without any
         # install media, so the installed system boots from the disk directly.
     elif env("VM_VHD_LINK"):
-        _prep_vhd_disk(osname, env("VM_VHD_LINK"))
+        _prep_vhd_disk(env("VM_VHD_LINK"))
         run_hook("prepareImage")
         createVMFromVHD(ostype, sshport)
         time.sleep(5)
@@ -1793,10 +1799,10 @@ def main(argv):
     def _restart():
         if isRunning() == 0 and shutdownVM() != 0:
             log("shutdown error"); sys.exit(1)
-        _wait_vm_down(osname, what="VM restart", poll=5)
+        _wait_vm_down(what="VM restart", poll=5)
         closeConsole(); start_and_wait()
 
-    if not _wait_ssh(osname, restart_cb=_restart):
+    if not _wait_ssh(restart_cb=_restart):
         return 1
 
     user = os.environ.get("USER", "user")
@@ -1811,7 +1817,7 @@ def main(argv):
 
     if run_hook("postBuild"):
         restart_and_wait()
-        if not _wait_ssh(osname):
+        if not _wait_ssh():
             log("ssh is failed."); return 1
 
     output = "%s-%s" % (osname, env("VM_RELEASE"))
@@ -1861,9 +1867,9 @@ def main(argv):
     else:
         addSSHAuthorizedKeys("%s-id_rsa.pub" % output)
         startVM()
-        while not _ssh_ready_check(osname, timeout=5):
+        while not _ssh_ready_check(timeout=5):
             log("not ready yet, just sleep."); time.sleep(5)
-        if not _send_env_check(osname):
+        if not _send_env_check():
             return 1
         if osname == "haiku":
             subprocess.call(["ssh", osname, "mkdir -p '$HOME/work'"])
