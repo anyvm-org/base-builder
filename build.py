@@ -1016,6 +1016,13 @@ def screenTextValue():
 
 
 def waitForText(text=None, sec="", hook=None):
+    """Poll the screen (VNC OCR or serial-console capture) every 3 s until
+    `text` is found in it, or `sec` seconds elapse. If `hook` is given, call
+    it on every poll BEFORE the screen capture -- useful for re-asserting an
+    action that may have been swallowed across a guest state change (e.g.
+    sending Ctrl+Alt+F2 every poll until the text console getty appears).
+    `hook` may be a Python callable (preferred) or a shell command string
+    (run via `bash -c ...`, kept for porting old hooks)."""
     if not text:
         log("Usage: waitForText text [sec]"); return 1
     if not _check_osname("waitForText"): return 1
@@ -1023,6 +1030,14 @@ def waitForText(text=None, sec="", hook=None):
     log("Waiting for text: %s" % text)
     t = 0
     while (not sec) or (t < int(sec)):
+        if hook is not None:
+            try:
+                if callable(hook):
+                    hook()
+                else:
+                    subprocess.run(["bash", "-c", str(hook)])
+            except Exception as e:
+                log("waitForText hook raised: %s" % e)
         time.sleep(3)
         screen = _screen_text_value(None)
         with open("_screenText.txt", "w") as f:
