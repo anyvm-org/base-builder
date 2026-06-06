@@ -1128,34 +1128,20 @@ def _key(osname, console_seq, vnc_key):
 
 
 def string(*args):
-    """Inject a literal string into the guest.
+    """Inject a literal string into the guest console. VM_OS_NAME must be
+    set; the build pipeline sets it from the conf, and exec()'d hooks
+    inherit it via this module's globals. The parts are joined with a
+    single space.
 
-    Accepted call forms (mirror the bash function, plus a robustness fix):
-      string("text")             -- VM_OS_NAME from env
-      string(osname, "text")     -- the leading osname arg is dropped if it
-                                    matches VM_OS_NAME; this is how hooks
-                                    typically write it.
-      string("a", "b", ...)      -- multiple parts joined with single space.
+      string("dhclient vtnet0")  -> guest types `dhclient vtnet0`
+      string("a", "b")           -> guest types `a b`
 
-    The osname is needed only to route the bytes to the right console session;
-    it must NEVER end up in the typed text. The previous API took osname
-    positionally and accidentally let it leak into the text when VM_OS_NAME
-    was also set, which produced `# midnightbsd dhclient vtnet0` (and the
-    /bin/sh: midnightbsd: not found errors) in early MidnightBSD runs."""
+    Do NOT pass osname as a leading arg. The old API accepted it and that
+    accidentally produced `# midnightbsd dhclient vtnet0` (root cause of the
+    initial MidnightBSD runs hanging at /bin/sh: midnightbsd: not found)."""
     osname = env("VM_OS_NAME")
-    args = list(args)
     if not osname:
-        if not args:
-            log("Usage: string text  (with VM_OS_NAME set) OR string osname text"); return 1
-        osname = args.pop(0)
-    # Drop a leading osname arg if the caller passed it (the bash habit).
-    # Only when there's also a real text arg behind -- a bare
-    # `string("midnightbsd")` whose payload literally IS the osname stays
-    # intact.
-    if len(args) >= 2 and args[0] == osname:
-        args.pop(0)
-    if not osname:
-        log("string: no osname"); return 1
+        log("string: VM_OS_NAME not set"); return 1
     text = " ".join(args)
     if env("VM_USE_CONSOLE_BUILD"):
         _send_console(osname, text)
@@ -1310,7 +1296,7 @@ def inputFile(osname=None, fpath=None):
     os.environ["VM_OS_NAME"] = osname
     if env("VM_USE_CONSOLE_BUILD"):
         _serve_file_nc(fpath, 64342)
-        string(osname, "nc  192.168.122.1 64342 | sh")
+        string("nc  192.168.122.1 64342 | sh")
         enter(osname)
     else:
         run(["vncdotool", "--force-caps", "--delay=150", "typefile", fpath])
@@ -1322,7 +1308,7 @@ def inputFileNC(osname=None, fpath=None):
         log("Usage: inputFile netbsd file.txt"); return 1
     os.environ["VM_OS_NAME"] = osname
     _serve_file_nc(fpath, 64342)
-    string(osname, "nc  192.168.122.1 64342 | sh")
+    string("nc  192.168.122.1 64342 | sh")
     enter(osname)
     return 0
 
@@ -1332,7 +1318,7 @@ def inputFileTelnet(osname=None, fpath=None):
         log("Usage: inputFile netbsd file.txt"); return 1
     os.environ["VM_OS_NAME"] = osname
     _serve_file_nc(fpath, 64342)
-    string(osname, "( sleep 1; ) | telnet 192.168.122.1 64342 | bash")
+    string("( sleep 1; ) | telnet 192.168.122.1 64342 | bash")
     enter(osname)
     return 0
 
@@ -1342,7 +1328,7 @@ def inputFileBash(osname=None, fpath=None):
         log("Usage: inputFile netbsd file.txt"); return 1
     os.environ["VM_OS_NAME"] = osname
     _serve_file_nc(fpath, 64342)
-    string(osname, "bash -c 'bash <(exec 3<>/dev/tcp/192.168.122.1/64342; cat <&3)'")
+    string("bash -c 'bash <(exec 3<>/dev/tcp/192.168.122.1/64342; cat <&3)'")
     enter(osname)
     return 0
 
@@ -1353,7 +1339,7 @@ def inputFileStdIn(osname=None, fpath=None):
     os.environ["VM_OS_NAME"] = osname
     with open(fpath, errors="replace") as f:
         for line in f:
-            string(osname, line.rstrip("\n"))
+            string(line.rstrip("\n"))
             enter(osname)
             time.sleep(1)
     return 0
@@ -1365,10 +1351,10 @@ def uploadFile(osname=None, local=None, remote=None):
     os.environ["VM_OS_NAME"] = osname
     if env("VM_USE_CONSOLE_BUILD"):
         _serve_file_nc(local, 64343)
-        string(osname, "nc  192.168.122.1 64343 >%s" % remote)
+        string("nc  192.168.122.1 64343 >%s" % remote)
         enter(osname)
     else:
-        string(osname, "cat - >%s" % remote)
+        string("cat - >%s" % remote)
         enter(osname)
         inputFile(osname, local)
         ctrlD(osname)
