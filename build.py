@@ -550,30 +550,52 @@ def _find_aarch64_efi_code(qemu_bin=None):
     return ""
 
 
-def _find_aarch64_efi_vars(code_src):
-    """Find the VARS template matching the given CODE firmware. anyvm.py:5272-5288.
+def _find_aarch64_efi_vars(code_src, qemu_bin=None):
+    """Find a VARS template matching the given CODE firmware.
 
-    EDK2 ships a pre-formatted NVRAM template next to the CODE blob; using a
-    blank vars region instead crashes NetBSD evbarm + (sometimes) other guests
-    with SetVariable-NVRAM-init failures that present as reboot loops at the
-    [1.000xxx] kernel mark. Try matching templates by name; return '' if none."""
+    Search CODE's own directory first (matching same-vendor pair) and then
+    fall back to **all** EFI search dirs -- on Debian/Ubuntu the
+    `qemu-efi-aarch64` package ships CODE as `/usr/share/qemu-efi-aarch64/
+    QEMU_EFI.fd` but the only working VARS template is in a different
+    directory `/usr/share/AAVMF/AAVMF_VARS.fd`; staying inside CODE's dir
+    finds nothing and we fall back to a blank vars region, which crashes
+    NetBSD evbarm + some other guests with SetVariable-NVRAM-init failures
+    that present as a tight reboot loop at the [1.000xxx] kernel mark.
+
+    A blank vars region is **always wrong on aarch64** -- if no template is
+    found anywhere we return '' and the caller logs a warning.
+    """
     if not code_src:
         return ""
-    d = os.path.dirname(code_src)
     base = os.path.basename(code_src)
-    guesses = []
-    for a, b in [("QEMU_EFI", "QEMU_VARS"), ("_CODE", "_VARS"),
-                 ("-code", "-vars"), ("CODE", "VARS")]:
-        if a in base:
-            guesses.append(os.path.join(d, base.replace(a, b)))
-    guesses += [
-        os.path.join(d, "QEMU_VARS.fd"),
-        os.path.join(d, "vars-template-pflash.raw"),
-        os.path.join(d, "AAVMF_VARS.fd"),
-    ]
-    for g in guesses:
+
+    def _name_guesses_in(d):
+        gs = []
+        # 1) Substituted-name pairs in the same directory (CODE/VARS, etc.)
+        for a, b in [("QEMU_EFI", "QEMU_VARS"), ("_CODE", "_VARS"),
+                     ("-code", "-vars"), ("CODE", "VARS")]:
+            if a in base:
+                gs.append(os.path.join(d, base.replace(a, b)))
+        # 2) Common template basenames anywhere we look.
+        gs += [
+            os.path.join(d, "QEMU_VARS.fd"),
+            os.path.join(d, "vars-template-pflash.raw"),
+            os.path.join(d, "AAVMF_VARS.fd"),
+        ]
+        return gs
+
+    # First pass: CODE's own directory (best chance of a matching pair).
+    for g in _name_guesses_in(os.path.dirname(code_src)):
         if g != code_src and os.path.exists(g):
             return g
+    # Second pass: every aarch64 EFI search directory + its known
+    # subdirectories (AAVMF, edk2/aarch64, qemu, qemu-efi-aarch64).
+    for d in _aarch64_efi_search_dirs(qemu_bin):
+        for sub in ("", "AAVMF", os.path.join("edk2", "aarch64"),
+                    "qemu", "qemu-efi-aarch64"):
+            for g in _name_guesses_in(os.path.join(d, sub)):
+                if g != code_src and os.path.exists(g):
+                    return g
     return ""
 
 
@@ -642,7 +664,7 @@ def build_qemu_args(media_kind=None, media_path=None):
             # Crucial: NetBSD evbarm + (sometimes) other aarch64 guests reboot
             # in a 3-second loop on a completely blank vars pflash because EDK2
             # cannot initialize NVRAM. Copy the matching VARS template instead.
-            vars_src = _find_aarch64_efi_vars(code_src)
+            vars_src = _find_aarch64_efi_vars(code_src, resolve_qemu_bin())
             if vars_src:
                 log("aarch64 vars template: %s" % vars_src)
                 copy_into(vars_src, varsf)
@@ -967,9 +989,24 @@ class ConsoleSession(object):
     def send(self, data):
         if isinstance(data, str):
             data = data.encode("utf-8", "replace")
+        # Emit one byte at a time with a small inter-byte delay. Raw-burst
+        # sendall() makes QEMU forward the whole string into the guest UART
+        # within microseconds, which races getty/login on slow consoles
+        # (NetBSD evbarm plcom0, OpenBSD wscons, ...) and the line discipline
+        # silently drops the tail. The 40ms cadence matches what vncdotool
+        # uses (--delay=40) and is empirically slow enough that every byte
+        # is echoed and acted on by login. Override with VM_CONSOLE_DELAY
+        # (ms) if some guest needs slower.
+        try:
+            delay = float(env("VM_CONSOLE_DELAY") or "40") / 1000.0
+        except (TypeError, ValueError):
+            delay = 0.040
         with self._send_lock:
             try:
-                self.ser.sendall(data)
+                for b in data:
+                    self.ser.sendall(bytes([b]))
+                    if delay > 0:
+                        time.sleep(delay)
             except OSError:
                 self._stop.set()
 
@@ -2167,9 +2204,16 @@ def _enable_ssh_root_branch(sshport):
 def _enable_ssh_console_branch():
     """The console-paste path used when there's no sshd reachable yet."""
     log("login as root at console.")
+    # Two early enters to flush whatever junk getty buffered during boot, then
+    # a long pause for the kernel to drain those bytes and for getty to settle
+    # at a clean "login:" prompt. Without this pause, login on slow consoles
+    # (NetBSD evbarm plcom0) merges the trailing enters with the "root" that
+    # follows and treats the whole thing as an empty username, so "root" never
+    # echoes and never logs in.
     inputKeys("enter"); inputKeys("enter"); time.sleep(20)
-    inputKeys("enter"); inputKeys("enter")
-    inputKeys("string root; enter; sleep 5;")
+    inputKeys("enter"); inputKeys("enter"); time.sleep(5)
+    inputKeys("string root; enter")
+    time.sleep(5)
     if env("VM_ROOT_PASSWORD"):
         inputKeys("string %s ; enter" % env("VM_ROOT_PASSWORD"))
         time.sleep(10)
