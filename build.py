@@ -120,13 +120,36 @@ def read_pid(osname):
 
 
 def pid_alive(pid):
+    """True iff `pid` is a live process (NOT a zombie). `os.kill(pid, 0)`
+    alone returns success for zombies (the PID stays in the table until its
+    parent waits on it), which would make isRunning() insist a crashed/
+    exited QEMU is still up and _wait_vm_down() loop forever. Reap our own
+    zombie child if we can, then re-check via /proc/<pid>/status which
+    exposes the actual state (R/S/D/Z/...)."""
     if not pid:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
-        return False
+        return False  # PID doesn't exist at all
+    # Reap if this is our own zombie child (no-op otherwise).
+    try:
+        gone, _status = os.waitpid(pid, os.WNOHANG)
+        if gone:
+            return False
+    except OSError:
+        pass  # not our child or already reaped
+    # Linux /proc/<pid>/status -- State is Z (zombie), X (dead), or a live state.
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for line in f:
+                if line.startswith("State:"):
+                    parts = line.split()
+                    state = parts[1] if len(parts) > 1 else ""
+                    return state not in ("Z", "X")
+    except OSError:
+        pass
+    return True
 
 
 def free_port(start, end):
@@ -636,11 +659,13 @@ def _send_console(osname, s):
         sess.send(s)
 
 
-def openConsole(osname):
+def openConsole():
     """Open the host-side serial connection used by string()/enter()/... in
     console-build mode. No-op in VNC mode -- QEMU already serves VNC on :0."""
+    osname = _check_osname("openConsole")
+    if not osname: return 1
     if env("VM_USE_CONSOLE_BUILD"):
-        closeConsole(osname)
+        closeConsole()
         try:
             serport = int(read_state(osname, "serport"))
         except ValueError:
@@ -655,7 +680,9 @@ def openConsole(osname):
     return 0
 
 
-def closeConsole(osname):
+def closeConsole():
+    osname = env("VM_OS_NAME")
+    if not osname: return 0
     with _console_sessions_lock:
         sess = _console_sessions.pop(osname, None)
     if sess:
@@ -716,10 +743,9 @@ def setup(install_ocr=None):
 # (G) VM lifecycle
 # ============================================================================
 
-def createVM(isolink=None, osname=None, ostype=None, sshport=None, disklink=None):
-    if not osname:
-        log("Usage: createVM isolink osname ostype sshport [formattedDiskLink]")
-        return 1
+def createVM(isolink=None, ostype=None, sshport=None, disklink=None):
+    osname = _check_osname("createVM")
+    if not osname: return 1
     vdi = "%s.qcow2" % osname
     iso = "%s.iso" % osname
     if isolink.endswith("img"):
@@ -742,9 +768,9 @@ def createVM(isolink=None, osname=None, ostype=None, sshport=None, disklink=None
     return launch_qemu(osname, "cdrom", iso)
 
 
-def createVMFromVHD(osname=None, ostype=None, sshport=None):
-    if not osname:
-        log("Usage: createVMFromVHD osname ostype sshport"); return 1
+def createVMFromVHD(ostype=None, sshport=None):
+    osname = _check_osname("createVMFromVHD")
+    if not osname: return 1
     vhd = "%s.qcow2" % osname
     run(["qemu-img", "resize", vhd, "+200G"])
     write_state(osname, "sshport", sshport or "22")
@@ -753,23 +779,23 @@ def createVMFromVHD(osname=None, ostype=None, sshport=None):
     return 0
 
 
-def startVM(osname=None):
-    if not osname:
-        log("Usage: startVM netbsd"); return 1
+def startVM():
+    osname = _check_osname("startVM")
+    if not osname: return 1
     return launch_qemu(osname)
 
 
-def shutdownVM(osname=None):
-    if not osname:
-        log("Usage: shutdownVM netbsd"); return 1
+def shutdownVM():
+    osname = _check_osname("shutdownVM")
+    if not osname: return 1
     qmon(osname, "system_powerdown")
     time.sleep(2)
     return 0
 
 
-def destroyVM(osname=None):
-    if not osname:
-        log("Usage: destroyVM netbsd"); return 1
+def destroyVM():
+    osname = _check_osname("destroyVM")
+    if not osname: return 1
     pid = read_pid(osname)
     if pid_alive(pid):
         try: os.kill(pid, signal.SIGTERM)
@@ -786,9 +812,11 @@ def destroyVM(osname=None):
     return 0
 
 
-def isRunning(osname=None):
-    """Silent check. Use _wait_vm_down() in pipelines so wait loops log a
-    periodic progress line instead of one per poll."""
+def isRunning():
+    """Silent check; returns 0 if VM running, 1 otherwise. Use _wait_vm_down()
+    in pipelines so wait loops log periodic progress."""
+    osname = env("VM_OS_NAME")
+    if not osname: return 1
     return 0 if pid_alive(read_pid(osname)) else 1
 
 
@@ -831,7 +859,7 @@ def _wait_vm_down(osname, what="VM", poll=20):
         "monitor 127.0.0.1:%s, serial 127.0.0.1:%s -> %s.serial.log)"
         % (what, poll, monport, serport, osname))
     elapsed = 0
-    while isRunning(osname) == 0:
+    while isRunning() == 0:
         time.sleep(poll)
         elapsed += poll
         size, tail = _serial_tail_line(osname)
@@ -840,12 +868,12 @@ def _wait_vm_down(osname, what="VM", poll=20):
     log("%s powered off after %d s" % (what, elapsed))
 
 
-def clearVM(osname=None):
-    if not osname:
-        log("Usage: clearVM netbsd"); return 1
-    if isRunning(osname) == 0:
-        destroyVM(osname)
-    closeConsole(osname)
+def clearVM():
+    osname = _check_osname("clearVM")
+    if not osname: return 1
+    if isRunning() == 0:
+        destroyVM()
+    closeConsole()
     for f in ["%s.qcow2" % osname, "%s.img" % osname, "%s.pid" % osname,
               "%s.monport" % osname, "%s.serport" % osname, "%s.sshport" % osname,
               "%s.serial.log" % osname, "%s.qemu.log" % osname, "%s.cmdline" % osname,
@@ -962,18 +990,20 @@ def _screen_text_value(osname, img=None):
     return text
 
 
-def screenText(osname=None, img=None):
-    if not osname:
-        log("Usage: screenText netbsd"); return 1
+def screenText(img=None):
+    osname = _check_osname("screenText")
+    if not osname: return 1
     text = _screen_text_value(osname, img)
     if not img:
         sys.stdout.write(text)
     return 0
 
 
-def waitForText(osname=None, text=None, sec="", hook=None):
+def waitForText(text=None, sec="", hook=None):
     if not text:
-        log("Usage: waitForText netbsd text"); return 1
+        log("Usage: waitForText text [sec]"); return 1
+    osname = _check_osname("waitForText")
+    if not osname: return 1
     sec = (str(sec) or "").strip()
     log("Waiting for text: %s" % text)
     t = 0
@@ -997,11 +1027,11 @@ _startweb_thread = None
 _startweb_stop = threading.Event()
 
 
-def startWeb(osname=None, needOCR=None):
+def startWeb(needOCR=None):
     """Start the local HTTP server + a background screen-capture loop in a
     daemon thread (was a detached subprocess)."""
-    if not osname:
-        log("Usage: startWeb netbsd"); return 1
+    osname = _check_osname("startWeb")
+    if not osname: return 1
     try: os.remove("_stopvnc.txt")
     except OSError: pass
     # The HTTP server can stay as a detached subprocess: it shares cwd with us
@@ -1039,14 +1069,18 @@ def pauseVNC():
 # (I) SSH / IP / export
 # ============================================================================
 
-def getVMIP(osname=None):
+def getVMIP():
     """Returns the guest's slirp IP from the QEMU monitor; for *logging only*
     under slirp -- the host has no route to the guest's 192.168.122.x. Host->
     guest SSH MUST go through the hostfwd port on 127.0.0.1."""
+    osname = env("VM_OS_NAME")
+    if not osname: return ""
     return parse_usernet_ip(qmon(osname, "info usernet") or "") or ""
 
 
-def addSSHHost(osname=None, idfile=None, user=None):
+def addSSHHost(idfile=None, user=None):
+    osname = _check_osname("addSSHHost")
+    if not osname: return 1
     if not user:
         user = "user" if osname == "haiku" else "root"
     idrsa = os.path.join(HOME, ".ssh", "id_rsa")
@@ -1086,17 +1120,21 @@ def addSSHAuthorizedKeys(pbk=None):
     return 0
 
 
-def addNAT(osname=None, proto=None, hostPort=None, vmPort=None):
+def addNAT(proto=None, hostPort=None, vmPort=None):
+    osname = _check_osname("addNAT")
+    if not osname: return 1
     if not vmPort:
-        log("Usage: addNAT osname protocol hostPort vmPort"); return 1
+        log("Usage: addNAT protocol hostPort vmPort"); return 1
     if qmon(osname, "hostfwd_add %s:127.0.0.1:%s-:%s" % (proto, hostPort, vmPort)) is None:
         log("addNAT: monitor not available for %s" % osname); return 1
     return 0
 
 
-def exportOVA(osname=None, ova=None, xml=None):
+def exportOVA(ova=None, xml=None):
+    osname = _check_osname("exportOVA")
+    if not osname: return 1
     if not ova:
-        log("Usage: exportOVA netbsd netbsd.9.2.qcow2"); return 1
+        log("Usage: exportOVA out.qcow2 [out.xml]"); return 1
     src = "%s.qcow2" % osname
     log(src)
     run(["qemu-img", "convert", "-O", "qcow2", "-o", "preallocation=off", src, ova])
@@ -1150,14 +1188,16 @@ def string(*args):
     return 0
 
 
-def _cur_osname(args):
-    if args: return args[0]
-    return env("VM_OS_NAME")
+def _check_osname(funcname):
+    o = env("VM_OS_NAME")
+    if not o:
+        log("%s: VM_OS_NAME not set" % funcname)
+    return o
 
 
-def space(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: space netbsd"); return 1
+def space():
+    osname = _check_osname("space")
+    if not osname: return 1
     if env("VM_USE_CONSOLE_BUILD"):
         _send_console(osname, " ")
     else:
@@ -1165,51 +1205,51 @@ def space(*args):
     return 0
 
 
-def enter(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: enter netbsd"); return 1
+def enter():
+    osname = _check_osname("enter")
+    if not osname: return 1
     _key(osname, "\r", "enter"); return 0
 
 
-def tab(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: tab netbsd"); return 1
+def tab():
+    osname = _check_osname("tab")
+    if not osname: return 1
     _key(osname, "\t", "tab"); return 0
 
 
-def f2(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: f2 netbsd"); return 1
+def f2():
+    osname = _check_osname("f2")
+    if not osname: return 1
     _key(osname, "\x1b[12~", "f2"); return 0
 
 
-def f7(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: f7 netbsd"); return 1
+def f7():
+    osname = _check_osname("f7")
+    if not osname: return 1
     _key(osname, "\x1b[18~", "f7"); return 0
 
 
-def f8(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: f8 netbsd"); return 1
+def f8():
+    osname = _check_osname("f8")
+    if not osname: return 1
     _key(osname, "\x1b[19~", "f8"); return 0
 
 
-def down(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: down netbsd"); return 1
+def down():
+    osname = _check_osname("down")
+    if not osname: return 1
     _key(osname, "\x1b[B", "down"); return 0
 
 
-def up(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: up netbsd"); return 1
+def up():
+    osname = _check_osname("up")
+    if not osname: return 1
     _key(osname, "\x1b[A", "up"); return 0
 
 
-def ctrlD(*args):
-    osname = _cur_osname(args)
-    if not osname: log("Usage: ctrlD netbsd"); return 1
+def ctrlD():
+    osname = _check_osname("ctrlD")
+    if not osname: return 1
     _key(osname, "\x04", "ctrl-d"); return 0
 
 
@@ -1224,14 +1264,12 @@ def _dispatch_keygroup(group):
     cmd, rest = group[0], group[1:]
     if cmd == "string":
         # rest tokens come from shlex with posix quoting; rejoin for type/send.
-        string(*rest) if env("VM_OS_NAME") else string(*rest)
-        # NB: bash original treats text after "string" as a single argument;
-        # shlex stripped quotes already so rejoining with space matches that.
+        string(*rest)
     elif cmd == "sleep":
         try: time.sleep(float(rest[0]))
         except (ValueError, IndexError): pass
     elif cmd in KEYFUNCS:
-        KEYFUNCS[cmd](*rest)
+        KEYFUNCS[cmd]()
     else:
         # Fall through to a PATH command. Mirrors the old bash `inputKeys` /
         # `input osname "..."` semantics, which did `eval "$*"` and would run
@@ -1268,11 +1306,10 @@ def _run_keyseq(keystr):
         _dispatch_keygroup(grp)
 
 
-def input_cmd(osname=None, *keyparts):
-    """Original bash function 'input osname "string xxx; enter"'."""
-    if not osname:
-        log("Usage: input netbsd enter"); return 1
-    os.environ["VM_OS_NAME"] = osname
+def input_cmd(*keyparts):
+    """Original bash function 'input osname "string xxx; enter"'. osname is
+    taken from VM_OS_NAME env (set by the build pipeline)."""
+    if not _check_osname("input"): return 1
     _run_keyseq(" ".join(keyparts))
     return 0
 
@@ -1290,80 +1327,81 @@ def _serve_file_nc(fpath, port):
     f.close()
 
 
-def inputFile(osname=None, fpath=None):
+def inputFile(fpath=None):
+    if not _check_osname("inputFile"): return 1
     if not fpath:
-        log("Usage: inputFile netbsd file.txt"); return 1
-    os.environ["VM_OS_NAME"] = osname
+        log("Usage: inputFile file.txt"); return 1
     if env("VM_USE_CONSOLE_BUILD"):
         _serve_file_nc(fpath, 64342)
         string("nc  192.168.122.1 64342 | sh")
-        enter(osname)
+        enter()
     else:
         run(["vncdotool", "--force-caps", "--delay=150", "typefile", fpath])
     return 0
 
 
-def inputFileNC(osname=None, fpath=None):
+def inputFileNC(fpath=None):
+    if not _check_osname("inputFileNC"): return 1
     if not fpath:
-        log("Usage: inputFile netbsd file.txt"); return 1
-    os.environ["VM_OS_NAME"] = osname
+        log("Usage: inputFileNC file.txt"); return 1
     _serve_file_nc(fpath, 64342)
     string("nc  192.168.122.1 64342 | sh")
-    enter(osname)
+    enter()
     return 0
 
 
-def inputFileTelnet(osname=None, fpath=None):
+def inputFileTelnet(fpath=None):
+    if not _check_osname("inputFileTelnet"): return 1
     if not fpath:
-        log("Usage: inputFile netbsd file.txt"); return 1
-    os.environ["VM_OS_NAME"] = osname
+        log("Usage: inputFileTelnet file.txt"); return 1
     _serve_file_nc(fpath, 64342)
     string("( sleep 1; ) | telnet 192.168.122.1 64342 | bash")
-    enter(osname)
+    enter()
     return 0
 
 
-def inputFileBash(osname=None, fpath=None):
+def inputFileBash(fpath=None):
+    if not _check_osname("inputFileBash"): return 1
     if not fpath:
-        log("Usage: inputFile netbsd file.txt"); return 1
-    os.environ["VM_OS_NAME"] = osname
+        log("Usage: inputFileBash file.txt"); return 1
     _serve_file_nc(fpath, 64342)
     string("bash -c 'bash <(exec 3<>/dev/tcp/192.168.122.1/64342; cat <&3)'")
-    enter(osname)
+    enter()
     return 0
 
 
-def inputFileStdIn(osname=None, fpath=None):
+def inputFileStdIn(fpath=None):
+    if not _check_osname("inputFileStdIn"): return 1
     if not fpath:
-        log("Usage: inputFile netbsd file.txt"); return 1
-    os.environ["VM_OS_NAME"] = osname
+        log("Usage: inputFileStdIn file.txt"); return 1
     with open(fpath, errors="replace") as f:
         for line in f:
             string(line.rstrip("\n"))
-            enter(osname)
+            enter()
             time.sleep(1)
     return 0
 
 
-def uploadFile(osname=None, local=None, remote=None):
-    if not osname:
-        log("Usage: uploadFile openbsd local remote"); return 1
-    os.environ["VM_OS_NAME"] = osname
+def uploadFile(local=None, remote=None):
+    if not _check_osname("uploadFile"): return 1
+    if not remote:
+        log("Usage: uploadFile local remote"); return 1
     if env("VM_USE_CONSOLE_BUILD"):
         _serve_file_nc(local, 64343)
         string("nc  192.168.122.1 64343 >%s" % remote)
-        enter(osname)
+        enter()
     else:
         string("cat - >%s" % remote)
-        enter(osname)
-        inputFile(osname, local)
-        ctrlD(osname)
+        enter()
+        inputFile(local)
+        ctrlD()
     return 0
 
 
-def processOpts(osname=None, optsfile=None):
+def processOpts(optsfile=None):
+    if not _check_osname("processOpts"): return 1
     if not optsfile:
-        log("Usage: processOpts netbsd netbsd.9.2.opts.txt"); return 1
+        log("Usage: processOpts optsfile"); return 1
     with open(optsfile, errors="replace") as f:
         for line in f:
             line = line.rstrip("\n")
@@ -1379,9 +1417,9 @@ def processOpts(osname=None, optsfile=None):
             log("========> Text:    %s" % text)
             log("========> Keys:    %s" % keys)
             log("========> Timeout: %s" % timeout)
-            if waitForText(osname, text, timeout) == 0:
+            if waitForText(text, timeout) == 0:
                 log("Input keys: %s" % keys)
-                input_cmd(osname, keys)
+                input_cmd(keys)
             else:
                 log("Timeout for waiting for text: %s" % text)
             time.sleep(1)
@@ -1452,8 +1490,8 @@ def run_hook(name):
 
 
 def inputKeys(keys):
-    """Convenience for hooks: input_cmd(VM_OS_NAME, keys)."""
-    return input_cmd(env("VM_OS_NAME"), keys)
+    """Convenience alias for input_cmd(keys). osname is taken from VM_OS_NAME."""
+    return input_cmd(keys)
 
 
 def conf_load(path):
@@ -1511,29 +1549,33 @@ def _wait_ssh(osname, max_retries=100, restart_cb=None):
     return True
 
 
-def start_and_wait(osname):
-    startVM(osname); time.sleep(2); openConsole(osname)
+def start_and_wait():
+    osname = _check_osname("start_and_wait")
+    if not osname: return
+    startVM(); time.sleep(2); openConsole()
     if not run_hook("waitForLoginTag"):
-        waitForText(osname, env("VM_LOGIN_TAG"))
+        waitForText(env("VM_LOGIN_TAG"))
     time.sleep(3)
 
 
-def shutdown_and_wait(osname):
+def shutdown_and_wait():
+    osname = _check_osname("shutdown_and_wait")
+    if not osname: return
     cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=2",
            osname, env("VM_SHUTDOWN_CMD")]
     rc = subprocess.run(cmd).returncode
     if rc != 0:
         log("shutdown rc=%d, ignoring (haiku?)" % rc)
     time.sleep(30)
-    if isRunning(osname) == 0:
-        if shutdownVM(osname) != 0:
+    if isRunning() == 0:
+        if shutdownVM() != 0:
             log("shutdown error")
     _wait_vm_down(osname, what="VM shutdown", poll=5)
-    closeConsole(osname)
+    closeConsole()
 
 
-def restart_and_wait(osname):
-    shutdown_and_wait(osname); start_and_wait(osname)
+def restart_and_wait():
+    shutdown_and_wait(); start_and_wait()
 
 
 def _prep_vhd_disk(osname, link):
@@ -1601,11 +1643,11 @@ def _gen_enablessh_local():
     log(open("enablessh.local").read())
 
 
-def _enable_ssh_root_branch(osname, sshport):
+def _enable_ssh_root_branch(sshport):
     """The VM_USE_SSHROOT_BUILD_SSH path: sshpass into root@guest, feed
     enablessh.local; under slirp we connect via the hostfwd port on 127.0.0.1
     (the guest's 192.168.122.x is not host-reachable)."""
-    vmip = getVMIP(osname)
+    vmip = getVMIP()
     log("guest slirp ip: %s (connecting via hostfwd 127.0.0.1:%s)" % (vmip, sshport))
     with open("enablessh.local", "rb") as inp:
         subprocess.run(
@@ -1624,7 +1666,7 @@ def _enable_ssh_root_branch(osname, sshport):
     log("ssh OK")
 
 
-def _enable_ssh_console_branch(osname):
+def _enable_ssh_console_branch():
     """The console-paste path used when there's no sshd reachable yet."""
     log("login as root at console.")
     inputKeys("enter"); inputKeys("enter"); time.sleep(20)
@@ -1634,16 +1676,16 @@ def _enable_ssh_console_branch(osname):
         inputKeys("string %s ; enter" % env("VM_ROOT_PASSWORD"))
         time.sleep(10)
     inputKeys("enter"); time.sleep(20); inputKeys("enter")
-    screenText(osname)
+    screenText()
     if run_hook("enableNetwork"):
-        screenText(osname); time.sleep(60)
+        screenText(); time.sleep(60)
     if env("VM_USE_NC_ENABLE_SSH"):
-        inputFileNC(osname, "enablessh.local")
+        inputFileNC("enablessh.local")
     elif env("VM_USE_BASH_ENABLE_SSH"):
-        inputFileBash(osname, "enablessh.local")
+        inputFileBash("enablessh.local")
     else:
-        inputFile(osname, "enablessh.local")
-    time.sleep(60); screenText(osname); time.sleep(10)
+        inputFile("enablessh.local")
+    time.sleep(60); screenText(); time.sleep(10)
     inputKeys("enter"); time.sleep(2)
     inputKeys("enter"); time.sleep(2)
 
@@ -1694,37 +1736,37 @@ def main(argv):
     sshport = g["sshport"]
     opts = g["opts"]
 
-    startWeb(osname, "needOCR")
+    startWeb("needOCR")
     setup("needOCR")
 
     log("============== host CPU ==============")
     sh("lscpu || cat /proc/cpuinfo || true")
     log("=====================================")
 
-    if clearVM(osname) != 0:
+    if clearVM() != 0:
         log("vm does not exist (ok)")
 
     if env("VM_ISO_LINK"):
-        createVM(env("VM_ISO_LINK"), osname, ostype, sshport, env("VM_PRE_DISK_LINK"))
+        createVM(env("VM_ISO_LINK"), ostype, sshport, env("VM_PRE_DISK_LINK"))
         time.sleep(2)
-        openConsole(osname)
+        openConsole()
         if not run_hook("installOpts"):
-            processOpts(osname, opts)
+            processOpts(opts)
             log("sleep 60 seconds. just wait")
             time.sleep(60)
-            if isRunning(osname) == 0:
-                if shutdownVM(osname) != 0:
+            if isRunning() == 0:
+                if shutdownVM() != 0:
                     log("shutdown error")
-                if destroyVM(osname) != 0:
+                if destroyVM() != 0:
                     log("destroyVM error")
         _wait_vm_down(osname, what="install", poll=20)
-        closeConsole(osname)
+        closeConsole()
         # No CDROM detach needed: the next startVM relaunches QEMU without any
         # install media, so the installed system boots from the disk directly.
     elif env("VM_VHD_LINK"):
         _prep_vhd_disk(osname, env("VM_VHD_LINK"))
         run_hook("prepareImage")
-        createVMFromVHD(osname, ostype, sshport)
+        createVMFromVHD(ostype, sshport)
         time.sleep(5)
     else:
         log("no VM_ISO_LINK or VM_VHD_LINK, can not build.")
@@ -1736,23 +1778,23 @@ def main(argv):
     if not env("VM_NO_VNC_BUILD"):
         os.environ["VM_USE_CONSOLE_BUILD"] = ""
 
-    start_and_wait(osname)
+    start_and_wait()
     _gen_enablessh_local()
 
     if not run_hook("enablessh"):
         if env("VM_USE_SSHROOT_BUILD_SSH"):
-            _enable_ssh_root_branch(osname, sshport)
+            _enable_ssh_root_branch(sshport)
         else:
-            _enable_ssh_console_branch(osname)
+            _enable_ssh_console_branch()
 
-    addSSHHost(osname)
+    addSSHHost()
     log("Sleep for the sshd to restart"); time.sleep(10)
 
     def _restart():
-        if isRunning(osname) == 0 and shutdownVM(osname) != 0:
+        if isRunning() == 0 and shutdownVM() != 0:
             log("shutdown error"); sys.exit(1)
         _wait_vm_down(osname, what="VM restart", poll=5)
-        closeConsole(osname); start_and_wait(osname)
+        closeConsole(); start_and_wait()
 
     if not _wait_ssh(osname, restart_cb=_restart):
         return 1
@@ -1768,7 +1810,7 @@ def main(argv):
     subprocess.run(["ssh", osname, "sh"], input=ssh_init.encode())
 
     if run_hook("postBuild"):
-        restart_and_wait(osname)
+        restart_and_wait()
         if not _wait_ssh(osname):
             log("ssh is failed."); return 1
 
@@ -1791,7 +1833,7 @@ def main(argv):
         with open(extra, "rb") as f:
             subprocess.run(["ssh", "-o", "SendEnv=VM_RELEASE", osname, "sh"], stdin=f)
 
-    shutdown_and_wait(osname)
+    shutdown_and_wait()
 
     # Host-side image-finalize hook (runs AFTER guest is down, BEFORE ISO is
     # removed below -- e.g. mounts the qcow2 to tweak files).
@@ -1808,7 +1850,7 @@ def main(argv):
     ova = "%s.qcow2" % output
     xml = "%s.xml" % output
     log("Exporting %s" % ova)
-    exportOVA(osname, ova, xml)
+    exportOVA(ova, xml)
 
     shutil.copy(os.path.join(HOME, ".ssh", "id_rsa"), "%s-host.id_rsa" % output)
     log("contents after export:"); sh("ls -lah")
@@ -1818,7 +1860,7 @@ def main(argv):
         log("skip")
     else:
         addSSHAuthorizedKeys("%s-id_rsa.pub" % output)
-        startVM(osname)
+        startVM()
         while not _ssh_ready_check(osname, timeout=5):
             log("not ready yet, just sleep."); time.sleep(5)
         if not _send_env_check(osname):
