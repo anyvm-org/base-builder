@@ -898,6 +898,41 @@ def vnc_capture(pngpath):
         time.sleep(3)
 
 
+# Public VNC helpers usable from hooks. These are thin wrappers over the
+# vncdotool CLI so hook code never needs to subprocess directly. They are
+# VNC-mode-only -- in console-build mode the keyboard helpers (string/enter/
+# tab/...) talk to the serial socket and a serial console has no mouse, no
+# super-alt-t, etc. Calling these in console mode will still try to drive
+# vncdotool but typically have no effect on the guest.
+
+def vncKey(key):
+    """Send a key event over VNC. `key` is a vncdotool name like 'enter',
+    'right', 'tab', 'super-alt-t', 'ctrl-c'."""
+    return subprocess.run(["vncdotool", "key", str(key)]).returncode
+
+
+def vncMove(x, y):
+    """Move the VNC pointer to absolute (x, y)."""
+    return subprocess.run(["vncdotool", "move", str(x), str(y)]).returncode
+
+
+def vncClick(button=1):
+    """Click a VNC mouse button (1=left, 2=middle, 3=right)."""
+    return subprocess.run(["vncdotool", "click", str(button)]).returncode
+
+
+def vncMoveClick(x, y, button=1):
+    """Move the pointer to (x, y) and click `button`, in one vncdotool call
+    (single TCP round trip to the VNC server)."""
+    return subprocess.run(["vncdotool", "move", str(x), str(y),
+                           "click", str(button)]).returncode
+
+
+def vncType(text):
+    """Type a literal string over VNC (with --force-caps for layout safety)."""
+    return subprocess.run(["vncdotool", "--force-caps", "type", text]).returncode
+
+
 def _write_index_html(osname, text):
     head = ("<!DOCTYPE html>\n<html>\n<head>\n<title>%s %s</title>\n"
             "<meta http-equiv='refresh' content='1'>\n</head>\n"
@@ -1192,7 +1227,17 @@ def _dispatch_keygroup(group):
     elif cmd in KEYFUNCS:
         KEYFUNCS[cmd](*rest)
     else:
-        log("input: unknown key command: %s" % cmd)
+        # Fall through to a PATH command. Mirrors the old bash `inputKeys` /
+        # `input osname "..."` semantics, which did `eval "$*"` and would run
+        # any shell command (e.g. `vncdotool key super-alt-t` directly inside
+        # an opts.txt step). We run it as argv (no shell interpretation), so
+        # quoting / metachars don't sneak in.
+        try:
+            subprocess.run([cmd] + list(rest))
+        except FileNotFoundError:
+            log("input: unknown key command and not on PATH: %s" % cmd)
+        except Exception as e:
+            log("input: %s: %s" % (cmd, e))
 
 
 def _run_keyseq(keystr):
