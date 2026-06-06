@@ -1260,20 +1260,62 @@ def processOpts(osname=None, optsfile=None):
 # ============================================================================
 
 def run_hook(name):
-    """exec() hooks/<name>.py in this module's globals so hook code can call
-    string/enter/waitForText/... directly. Returns True if the hook ran.
-    Mirrors the old `. hooks/<name>.sh` source semantics."""
-    path = "hooks/%s.py" % name
-    if not os.path.exists(path):
-        return False
-    log("hooks/%s.py" % name)
-    with open(path) as f:
-        code = f.read()
-    log(code)
-    g = globals()
-    g.setdefault("__hookname__", name)
-    exec(compile(code, path, "exec"), g)
-    return True
+    """Run a hook. Returns True if any hook ran. Where the hook runs is encoded
+    in the filename prefix:
+
+      hooks/host_<name>.py  -- host-side, exec()'d into THIS module's globals.
+                               The hook can call build.py functions directly
+                               (waitForText, inputKeys, string, enter,
+                               screenText, ...) and see pipeline globals
+                               (osname, ostype, sshport, opts) as bare names.
+                               Use whenever the hook needs the VM-abstraction
+                               API. Lookup precedence #1.
+
+      hooks/host_<name>.sh  -- host-side, plain `bash` subprocess. The conf's
+                               VM_* env vars are inherited. Use for straight
+                               bash tooling on the host that does NOT need
+                               build.py functions (virt-customize, qemu-img,
+                               shell glue, ...). Lookup precedence #2.
+
+      hooks/vm_<name>.sh    -- guest-side, piped into the guest's sh via SSH
+                               with SendEnv=VM_RELEASE. Use for in-guest
+                               configuration (service xxx enable, sysrc,
+                               editing /etc/*, installing packages, ...).
+                               Guest hooks are always .sh because the guest
+                               is not guaranteed to have Python. Lookup
+                               precedence #3.
+
+    Callers pass the logical hook name (e.g. "installOpts", "postBuild");
+    the prefix lookup is internal."""
+    py = "hooks/host_%s.py" % name
+    if os.path.exists(py):
+        log(py)
+        with open(py) as f:
+            code = f.read()
+        log(code)
+        g = globals()
+        g.setdefault("__hookname__", name)
+        exec(compile(code, py, "exec"), g)
+        return True
+    host_sh = "hooks/host_%s.sh" % name
+    if os.path.exists(host_sh):
+        log(host_sh)
+        with open(host_sh) as f:
+            log(f.read())
+        subprocess.run(["bash", host_sh], env=os.environ.copy())
+        return True
+    vm_sh = "hooks/vm_%s.sh" % name
+    if os.path.exists(vm_sh):
+        log(vm_sh)
+        with open(vm_sh) as f:
+            log(f.read())
+        with open(vm_sh, "rb") as f:
+            subprocess.run(
+                ["ssh", "-o", "SendEnv=VM_RELEASE",
+                 globals().get("osname") or env("VM_OS_NAME"), "sh"],
+                stdin=f)
+        return True
+    return False
 
 
 def inputKeys(keys):
