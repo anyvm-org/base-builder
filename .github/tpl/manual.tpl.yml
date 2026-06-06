@@ -30,7 +30,7 @@ jobs:
         latest=$(cat $(ls conf/{{VM_OS_NAME}}-*.conf | tail -1) | grep VM_RELEASE | cut -d = -f 2)
         echo "please loging to ssh below, and run:"
         echo "============================="
-        echo "bash build.sh conf/{{VM_OS_NAME}}-$latest.conf"
+        echo "python3 build.py conf/{{VM_OS_NAME}}-$latest.conf"
         echo "============================="
         touch /tmp/keepalive
 
