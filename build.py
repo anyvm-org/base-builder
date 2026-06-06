@@ -421,13 +421,25 @@ def build_qemu_args(media_kind=None, media_path=None):
         else:                cpu = "qemu64,+rdrand,+rdseed"
         a += ["-cpu", cpu]
         a += ["-device", "%s,netdev=net0" % nic, "-device", "virtio-balloon-pci"]
+        # Pin the install CDROM (when present) to IDE primary master,
+        # matching the libvirt-era release XML (`<target dev='hda' bus='ide'/>`).
+        # That makes the guest see it as cd0a -- NetBSD sysinst's default
+        # mount path. QEMU's `-cdrom` shortcut puts it at IDE index=2
+        # (secondary master = cd1a), which NetBSD then fails to mount and
+        # falls into the "Distribution medium" menu loop.
+        # When the main disk is also on IDE (dragonflybsd / ghostbsd:
+        # VM_DISK=ide), shift it to secondary master to avoid colliding
+        # with the cdrom slot.
         if dif == "sata":
             a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
             a += ["-device", "ich9-ahci,id=ahci0", "-device", "ide-hd,bus=ahci0.0,drive=disk0"]
+        elif dif == "ide" and media_kind == "cdrom":
+            a += ["-drive", "file=%s,format=qcow2,if=ide,index=2,discard=unmap,detect-zeroes=unmap" % qcow]
         else:
             a += ["-drive", "file=%s,format=qcow2,if=%s,discard=unmap,detect-zeroes=unmap" % (qcow, dif)]
         if media_kind == "cdrom":
-            a += ["-cdrom", media_path, "-boot", "order=dc,menu=off"]
+            a += ["-drive", "file=%s,format=raw,if=ide,index=0,media=cdrom" % media_path,
+                  "-boot", "order=dc,menu=off"]
         elif media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=ide" % media_path]
         a += ["-vga", "std"]
