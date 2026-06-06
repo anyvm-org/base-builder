@@ -1127,16 +1127,36 @@ def _key(osname, console_seq, vnc_key):
         run(["vncdotool", "key", vnc_key])
 
 
-def string(osname_or_text=None, *rest):
-    """string(text) when VM_OS_NAME is set in env; string(osname, text) otherwise.
-    Mirrors the bash function's osname resolution."""
+def string(*args):
+    """Inject a literal string into the guest.
+
+    Accepted call forms (mirror the bash function, plus a robustness fix):
+      string("text")             -- VM_OS_NAME from env
+      string(osname, "text")     -- the leading osname arg is dropped if it
+                                    matches VM_OS_NAME; this is how hooks
+                                    typically write it.
+      string("a", "b", ...)      -- multiple parts joined with single space.
+
+    The osname is needed only to route the bytes to the right console session;
+    it must NEVER end up in the typed text. The previous API took osname
+    positionally and accidentally let it leak into the text when VM_OS_NAME
+    was also set, which produced `# midnightbsd dhclient vtnet0` (and the
+    /bin/sh: midnightbsd: not found errors) in early MidnightBSD runs."""
     osname = env("VM_OS_NAME")
-    args = [osname_or_text] + list(rest) if osname_or_text is not None else list(rest)
+    args = list(args)
     if not osname:
         if not args:
-            log("Usage: string netbsd"); return 1
+            log("Usage: string text  (with VM_OS_NAME set) OR string osname text"); return 1
         osname = args.pop(0)
-    text = " ".join(args) if args else ""
+    # Drop a leading osname arg if the caller passed it (the bash habit).
+    # Only when there's also a real text arg behind -- a bare
+    # `string("midnightbsd")` whose payload literally IS the osname stays
+    # intact.
+    if len(args) >= 2 and args[0] == osname:
+        args.pop(0)
+    if not osname:
+        log("string: no osname"); return 1
+    text = " ".join(args)
     if env("VM_USE_CONSOLE_BUILD"):
         _send_console(osname, text)
     else:
