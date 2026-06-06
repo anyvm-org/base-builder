@@ -72,6 +72,29 @@ def sh(cmdstr):
     return subprocess.call(cmdstr, shell=True)
 
 
+def _run_quiet(cmd, **kw):
+    """Run a noisy command (apt/brew/pip/etc.) silently; on non-zero exit dump
+    the captured output so failures are still debuggable."""
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    r = subprocess.run(cmd, **kw)
+    if r.returncode != 0:
+        log("FAILED (rc=%d): %s" % (r.returncode, " ".join(map(str, cmd))))
+        if r.stdout: log(r.stdout)
+        if r.stderr: log(r.stderr)
+    return r
+
+
+def _sh_quiet(cmdstr):
+    """Shell-string variant of _run_quiet."""
+    r = subprocess.run(cmdstr, shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        log("FAILED (rc=%d): %s" % (r.returncode, cmdstr))
+        if r.stdout: log(r.stdout)
+        if r.stderr: log(r.stderr)
+    return r.returncode
+
+
 def state(osname, suffix):
     return "%s.%s" % (osname, suffix)
 
@@ -645,34 +668,47 @@ def closeConsole(osname):
 # ============================================================================
 
 def setup(install_ocr=None):
+    """Install host dependencies. All package-manager output is captured and
+    only printed on failure -- normal runs stay quiet."""
+    log("setup: installing host dependencies (silent unless something fails)")
     if is_linux():
-        run(["sudo", "apt-get", "update"])
-        run(["sudo", "apt-get", "install", "-y", "zstd", "qemu-utils",
-             "qemu-system-x86", "ovmf", "expect", "sshpass", "netcat-openbsd"])
+        apt_env = dict(os.environ)
+        apt_env["DEBIAN_FRONTEND"] = "noninteractive"
+        _run_quiet(["sudo", "-E", "apt-get", "update", "-qq"], env=apt_env)
+        _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+                    "zstd", "qemu-utils", "qemu-system-x86", "ovmf", "expect",
+                    "sshpass", "netcat-openbsd"], env=apt_env)
         if install_ocr:
-            run(["sudo", "apt-get", "install", "-y", "tesseract-ocr",
-                 "python3-pil", "tesseract-ocr-eng", "tesseract-ocr-script-latn",
-                 "python3-opencv", "python3-pip"])
-            if sh("pip3 install --break-system-packages pytesseract opencv-python vncdotool") != 0:
-                sh("pip3 install pytesseract opencv-python vncdotool")
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+                        "tesseract-ocr", "python3-pil",
+                        "tesseract-ocr-eng", "tesseract-ocr-script-latn",
+                        "python3-opencv", "python3-pip"], env=apt_env)
+            if _sh_quiet("pip3 install -q --break-system-packages "
+                         "pytesseract opencv-python vncdotool") != 0:
+                _sh_quiet("pip3 install -q pytesseract opencv-python vncdotool")
             vp = os.path.join(HOME, ".local", "bin", "vncdotool")
             if os.path.exists(vp):
-                run(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
+                _run_quiet(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
         if env("VM_ARCH") == "riscv64":
-            run(["sudo", "apt-get", "install", "-y", "qemu-system-misc", "u-boot-qemu"])
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+                        "qemu-system-misc", "u-boot-qemu"], env=apt_env)
         if env("VM_ARCH") == "aarch64":
-            run(["sudo", "apt-get", "install", "-y", "qemu-system-arm", "qemu-efi-aarch64"])
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+                        "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
     else:
-        run(["brew", "install", "tesseract", "qemu"])
-        sh("pip3 install pytesseract opencv-python vncdotool")
+        _run_quiet(["brew", "install", "tesseract", "qemu"])
+        _sh_quiet("pip3 install -q pytesseract opencv-python vncdotool")
         log("Reloading sshd services in the Host")
-        sh('sudo sh -c \'echo "" >>/etc/ssh/sshd_config; '
-           'echo "StrictModes no" >>/etc/ssh/sshd_config\'')
-        run(["sudo", "launchctl", "unload", "/System/Library/LaunchDaemons/ssh.plist"])
-        run(["sudo", "launchctl", "load", "-w", "/System/Library/LaunchDaemons/ssh.plist"])
+        _sh_quiet('sudo sh -c \'echo "" >>/etc/ssh/sshd_config; '
+                  'echo "StrictModes no" >>/etc/ssh/sshd_config\'')
+        _run_quiet(["sudo", "launchctl", "unload",
+                    "/System/Library/LaunchDaemons/ssh.plist"])
+        _run_quiet(["sudo", "launchctl", "load", "-w",
+                    "/System/Library/LaunchDaemons/ssh.plist"])
     os.makedirs(os.path.join(HOME, ".ssh"), exist_ok=True)
     os.chmod(os.path.join(HOME, ".ssh"), 0o700)
-    run(["sudo", "chmod", "755", HOME])
+    _run_quiet(["sudo", "chmod", "755", HOME])
+    log("setup: done")
     return 0
 
 
@@ -751,11 +787,57 @@ def destroyVM(osname=None):
 
 
 def isRunning(osname=None):
-    pid = read_pid(osname)
-    if pid_alive(pid):
-        log("%s running pid=%d" % (osname, pid))
-        return 0
-    return 1
+    """Silent check. Use _wait_vm_down() in pipelines so wait loops log a
+    periodic progress line instead of one per poll."""
+    return 0 if pid_alive(read_pid(osname)) else 1
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _serial_tail_line(osname, window=4096):
+    """Return the last non-empty line of the QEMU serial log (with ANSI escape
+    sequences and control bytes stripped). Used to show what the guest is
+    actually doing during long waits."""
+    path = "%s.serial.log" % osname
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - window))
+            buf = f.read()
+    except OSError:
+        return 0, ""
+    text = buf.decode("utf-8", "replace")
+    text = _ANSI_RE.sub("", text)
+    text = _CTRL_RE.sub("", text)
+    last = ""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line:
+            last = line
+            break
+    return size, last
+
+
+def _wait_vm_down(osname, what="VM", poll=20):
+    """Block until isRunning(osname) reports not-running. Every poll prints a
+    one-line status: elapsed time, size of <osname>.serial.log, and the last
+    non-empty line of the guest console -- so it's obvious whether the install
+    is making progress or stuck."""
+    monport = read_state(osname, "monport")
+    serport = read_state(osname, "serport")
+    log("waiting for %s to power off (poll %ds; vnc 127.0.0.1:0, "
+        "monitor 127.0.0.1:%s, serial 127.0.0.1:%s -> %s.serial.log)"
+        % (what, poll, monport, serport, osname))
+    elapsed = 0
+    while isRunning(osname) == 0:
+        time.sleep(poll)
+        elapsed += poll
+        size, tail = _serial_tail_line(osname)
+        mm, ss = divmod(elapsed, 60)
+        log("[%dm%02ds] %s, serial=%dB | %s" % (mm, ss, what, size, tail[:140]))
+    log("%s powered off after %d s" % (what, elapsed))
 
 
 def clearVM(osname=None):
@@ -1395,8 +1477,7 @@ def shutdown_and_wait(osname):
     if isRunning(osname) == 0:
         if shutdownVM(osname) != 0:
             log("shutdown error")
-    while isRunning(osname) == 0:
-        time.sleep(5)
+    _wait_vm_down(osname, what="VM shutdown", poll=5)
     closeConsole(osname)
 
 
@@ -1585,8 +1666,7 @@ def main(argv):
                     log("shutdown error")
                 if destroyVM(osname) != 0:
                     log("destroyVM error")
-        while isRunning(osname) == 0:
-            time.sleep(20)
+        _wait_vm_down(osname, what="install", poll=20)
         closeConsole(osname)
         # No CDROM detach needed: the next startVM relaunches QEMU without any
         # install media, so the installed system boots from the disk directly.
@@ -1620,8 +1700,7 @@ def main(argv):
     def _restart():
         if isRunning(osname) == 0 and shutdownVM(osname) != 0:
             log("shutdown error"); sys.exit(1)
-        while isRunning(osname) == 0:
-            time.sleep(5)
+        _wait_vm_down(osname, what="VM restart", poll=5)
         closeConsole(osname); start_and_wait(osname)
 
     if not _wait_ssh(osname, restart_cb=_restart):
