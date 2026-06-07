@@ -767,25 +767,42 @@ def build_qemu_args(media_kind=None, media_path=None):
         if accel == "kvm":
             a += ["-global", "kvm-pit.lost_tick_policy=delay"]
         a += ["-device", "%s,netdev=net0" % nic, "-device", "virtio-balloon-pci"]
-        # Pin the install CDROM (when present) to IDE primary master,
-        # matching the libvirt-era release XML (`<target dev='hda' bus='ide'/>`).
-        # That makes the guest see it as cd0a -- NetBSD sysinst's default
-        # mount path. QEMU's `-cdrom` shortcut puts it at IDE index=2
-        # (secondary master = cd1a), which NetBSD then fails to mount and
-        # falls into the "Distribution medium" menu loop.
-        # When the main disk is also on IDE (dragonflybsd / ghostbsd:
-        # VM_DISK=ide), shift it to secondary master to avoid colliding
-        # with the cdrom slot.
+        # CDROM / disk IDE-slot placement -- two layouts depending on whether
+        # the main disk itself sits on the IDE bus.
+        #
+        #  * Disk NOT on IDE (e.g. NetBSD, which has no VM_DISK and so defaults
+        #    to virtio). Pin the install CDROM to IDE primary master (index=0),
+        #    matching the libvirt-era release XML (`<target dev='hda'
+        #    bus='ide'/>`) so the guest sees it as cd0a -- NetBSD sysinst's
+        #    default mount path. QEMU's `-cdrom` shortcut would instead land it
+        #    at index=2 (cd1a), which NetBSD fails to mount, looping in the
+        #    "Distribution medium" menu. The virtio disk never shares the IDE
+        #    bus, so this cannot disturb the disk's identity.
+        #
+        #  * Disk ON IDE (dragonflybsd / ghostbsd: VM_DISK=ide). The disk MUST
+        #    stay on IDE primary master (index=0) so QEMU hands it the lowest
+        #    auto serial (QM00001) in BOTH the install run (CDROM present) and
+        #    the startVM reboot (CDROM gone). QEMU assigns `QM%05d` serials in
+        #    IDE init order (index 0,1,2,3), independent of disk-vs-cdrom. If
+        #    the CDROM stole index=0 the disk would be QM00003 during install
+        #    but QM00001 on reboot, so DragonFly's recorded root device
+        #    `serno/QM00003` would vanish -> "Root mount failed: 6" hang at
+        #    mountroot>. So here the CDROM goes on secondary master via the
+        #    `-cdrom` shortcut (index=2) and the disk keeps index=0.
+        ide_disk = (dif == "ide")
         if dif == "sata":
             a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
             a += ["-device", "ich9-ahci,id=ahci0", "-device", "ide-hd,bus=ahci0.0,drive=disk0"]
-        elif dif == "ide" and media_kind == "cdrom":
-            a += ["-drive", "file=%s,format=qcow2,if=ide,index=2,discard=unmap,detect-zeroes=unmap" % qcow]
         else:
             a += ["-drive", "file=%s,format=qcow2,if=%s,discard=unmap,detect-zeroes=unmap" % (qcow, dif)]
         if media_kind == "cdrom":
-            a += ["-drive", "file=%s,format=raw,if=ide,index=0,media=cdrom" % media_path,
-                  "-boot", "order=dc,menu=off"]
+            if ide_disk:
+                # IDE disk already holds index=0; CDROM goes to secondary
+                # master (index=2) so the disk keeps its stable serial.
+                a += ["-cdrom", media_path, "-boot", "order=dc,menu=off"]
+            else:
+                a += ["-drive", "file=%s,format=raw,if=ide,index=0,media=cdrom" % media_path,
+                      "-boot", "order=dc,menu=off"]
         elif media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=ide" % media_path]
         # VGA device, anyvm.py:5441-5444. NetBSD/Haiku -> std,
