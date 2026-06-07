@@ -494,15 +494,15 @@ def disk_if():
 
 
 def obsd_acpi_off():
-    """openbsd aarch64 < 7.4 needs acpi=off for FDT PCI routing."""
-    if env("VM_OS_NAME") != "openbsd" or env("VM_ARCH") != "aarch64":
-        return False
-    rel = (env("VM_RELEASE") or "").split("-", 1)[0].split(".")
-    try:
-        maj = int(rel[0]); mn = int(rel[1]) if len(rel) > 1 else 0
-    except (ValueError, IndexError):
-        return False
-    return (maj, mn) < (7, 4)
+    """openbsd aarch64 install needs acpi=off (force FDT / device-tree mode).
+    The libvirt-era builder that successfully installed every openbsd aarch64
+    release (vbox.sh: virt-install ... --machine virt --noacpi) disabled ACPI
+    for ALL aarch64, not just < 7.4: OpenBSD's bsd.rd installer kernel
+    boot-loops under ACPI on the QEMU virt machine (kernel resets right after
+    BOOTAA64 loads it -- reproduced on CI). anyvm.py only needs acpi=off for
+    < 7.4 because it RUNS finished images (the installed kernel is fine under
+    ACPI); the INSTALL path is what needs FDT. So: all openbsd aarch64."""
+    return env("VM_OS_NAME") == "openbsd" and env("VM_ARCH") == "aarch64"
 
 
 def make_blank(path, mb):
