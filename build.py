@@ -1402,9 +1402,14 @@ def ocr_paddle(img):
     global _PADDLE_OCR
     try:
         if _PADDLE_OCR is None:
+            # Cap CPU: paddlepaddle otherwise spins ~6 OpenMP threads per
+            # predict, which on a 2-4 vCPU CI runner saturates the box and
+            # starves the KVM guest's boot / sshd. cpu_threads=2 plus
+            # OMP_NUM_THREADS keep each predict near ~1s while staying in budget.
+            os.environ.setdefault("OMP_NUM_THREADS", "2")
             from paddleocr import PaddleOCR
             _PADDLE_OCR = PaddleOCR(
-                lang="en", enable_mkldnn=False,
+                lang="en", enable_mkldnn=False, cpu_threads=2,
                 text_detection_model_name="PP-OCRv5_mobile_det",
                 text_recognition_model_name="en_PP-OCRv5_mobile_rec",
                 use_doc_orientation_classify=False,
