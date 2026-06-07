@@ -70,6 +70,6 @@ jobs:
           {{VM_OS_NAME}}-${{ matrix.os }}.qcow2.zst*
           {{VM_OS_NAME}}-${{ matrix.os }}-id_rsa.pub
           {{VM_OS_NAME}}-${{ matrix.os }}-host.id_rsa
-          {{VM_OS_NAME}}-${{ matrix.os }}.xml
+          {{VM_OS_NAME}}-${{ matrix.os }}.qemu
 
 
