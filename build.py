@@ -850,10 +850,13 @@ def build_qemu_args(media_kind=None, media_path=None):
         # is the FreeBSD / Linux guest target on ppc64; powernv* is OPAL
         # bare-metal and won't boot a stock distro install ISO.
         #
-        # FreeBSD/powerpc64 is BIG-ENDIAN (ELFv1). Passing arch=powerpc64le
-        # would still target -M pseries, but the guest ISO/kernel would have
-        # to be little-endian -- no FreeBSD/powerpc64le port exists, so in
-        # practice this branch only fires for the BE case today.
+        # Endianness is decided by the GUEST image, not by QEMU: the same
+        # -M pseries + qemu-system-ppc64 binary boots both. FreeBSD ships a
+        # big-endian port (powerpc64, ELFv1) AND a little-endian port
+        # (powerpc64le, ELFv2); SLOF reads the ELF header and the loader sets
+        # MSR[LE] accordingly. POWER8+ is bi-endian so -cpu power9 serves
+        # both -- no machine/cpu difference between the two. The arch only
+        # changes which ISO/distfiles the conf + install hook fetch.
         #
         # Console: -serial chardev:serial0 is routed by pseries to the SPAPR
         # virtual teletype (spapr-vty), which the guest enumerates as
