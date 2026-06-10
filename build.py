@@ -350,6 +350,14 @@ def qemu_bin_name():
 
 
 def resolve_qemu_bin():
+    # VM_QEMU_BIN lets a conf swap in a different QEMU build (extracted by
+    # setup() from a VM_QEMU_TAR tarball committed in the builder repo).
+    # Needed when the distro QEMU is too old for a guest: Ubuntu 26.04
+    # riscv64 needs QEMU >= 9.1 (see the riscv64 -cpu comment below).
+    # QEMU locates its datadir relative to the binary (<bindir>/../share/
+    # qemu), so an extracted bin/ + share/qemu tree works from any path.
+    if env("VM_QEMU_BIN"):
+        return os.path.abspath(env("VM_QEMU_BIN"))
     n = qemu_bin_name()
     return shutil.which(n) or n
 
@@ -709,6 +717,19 @@ def build_qemu_args(media_kind=None, media_path=None):
         a += ["-object", "rng-builtin,id=rng0",
               "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=1000"]
 
+    # Optional firmware override. A conf can point VM_BIOS at a file
+    # (relative to the repo root the pipeline runs in) to replace the
+    # firmware QEMU would load for the machine type. Needed by
+    # openbsd/sparc64: the OpenBIOS bundled with QEMU crashes every
+    # OpenBSD >= 7.3 kernel on cold boot (call-method catch result stored
+    # past the client's argument array when nreturns == 0) and names the
+    # IDE channel nodes "ide" instead of OBP's "ata", which breaks the
+    # kernel's root-device autodetection. openbsd-builder vendors a
+    # patched blob; see its bios/README.md for provenance and rebuild
+    # instructions.
+    if env("VM_BIOS"):
+        a += ["-bios", env("VM_BIOS")]
+
     if arch == "aarch64":
         efi = "%s-QEMU_EFI.fd" % osname
         varsf = "%s-QEMU_EFI_VARS.fd" % osname
@@ -772,7 +793,16 @@ def build_qemu_args(media_kind=None, media_path=None):
             a += ["-device", "usb-kbd", "-device", "virtio-tablet-pci"]
 
     elif arch == "riscv64":
-        a += ["-machine", "virt,accel=tcg,usb=on,acpi=off", "-cpu", "rv64"]
+        # -cpu rv64 (plain RV64GC) covers most guests. VM_CPU_MODEL lets a
+        # conf pick a richer model: Ubuntu 26.04 riscv64 userspace is built
+        # for the RVA23 profile baseline, so init dies with SIGILL
+        # (do_trap_insn_illegal) under rv64 -- it needs -cpu rva23s64,
+        # which only exists in QEMU >= 9.1 (pair it with VM_QEMU_BIN /
+        # VM_QEMU_TAR; the runner's stock QEMU 8.2 additionally cannot
+        # boot 26.04's kernel 7.0 at all -- it hangs at entry with zero
+        # output).
+        rcpu = env("VM_CPU_MODEL") or "rv64"
+        a += ["-machine", "virt,accel=tcg,usb=on,acpi=off", "-cpu", rcpu]
         # NetBSD/riscv GENERIC64 drives virtio over MMIO, not PCI: virtio-blk-pci
         # enumerates "not configured" so the kernel can't find root ("boot
         # device: <unknown>" -> root device prompt). Use the MMIO virtio-*-device
@@ -784,11 +814,23 @@ def build_qemu_args(media_kind=None, media_path=None):
             a += ["-device", "virtio-balloon-pci"]
         # Use uboot.elf (ELF with proper entry point + segments), NOT the raw
         # u-boot.bin -- Ubuntu's official RISC-V QEMU docs recommend the ELF
-        # variant. Empirically the .bin variant breaks the FDT handoff for
-        # Ubuntu 22.04 jammy riscv64 ("Failed to reserve memory for fdt at
-        # 0x1feead700 / FDT creation failed! hanging..."); the .elf variant
-        # is what cloud-images upstream tests against.
-        a += ["-kernel", "/usr/lib/u-boot/qemu-riscv64_smode/uboot.elf"]
+        # variant.
+        #
+        # VM_UBOOT lets a conf swap in a different u-boot build (a file
+        # committed in the builder repo, e.g. under files/ -- no download).
+        # Needed for Ubuntu 22.04 jammy: its riscv64 cloud image boots via
+        # u-boot's extlinux/sysboot path (/boot on the root partition, EMPTY
+        # ESP -- no grub at all), and u-boot >= 2024.10's LMB rework made the
+        # in-place FDT reservation fail there ("Failed to reserve memory for
+        # fdt at 0x<RAM-top-ish> / FDT creation failed! hanging..."): the
+        # qemu-riscv default env pins fdt_high=0xffffffffffffffff (never
+        # relocate the FDT), and the working FDT lives inside u-boot's own
+        # pre-reserved region, so lmb_reserve() now returns -EEXIST at ANY
+        # -m size. The noble GA u-boot 2024.01 predates the rework and boots
+        # the same image unattended (empirically verified). 24.04/26.04
+        # images boot via the EFI grub path instead and never run that code.
+        uboot = env("VM_UBOOT") or "/usr/lib/u-boot/qemu-riscv64_smode/uboot.elf"
+        a += ["-kernel", uboot]
         if media_kind == "disk":
             if nb:
                 a += ["-drive", "file=%s,format=raw,if=none,id=inst0" % media_path,
@@ -827,7 +869,21 @@ def build_qemu_args(media_kind=None, media_path=None):
         #     the empty secondary Simba-bridge bus `pciB` and bind it to net0;
         #     the explicit -device suppresses the default onboard NIC, so the
         #     guest enumerates exactly one hme0.
-        a += ["-machine", "sun4u", "-vga", "none"]
+        #
+        # OpenBSD/sparc64 additionally needs:
+        #   * a patched OpenBIOS via VM_BIOS (the bundled blob makes every
+        #     >= 7.3 kernel crash on cold boot and breaks root autodetection;
+        #     see openbsd-builder bios/README.md),
+        #   * VM_NIC=ne2k_pci (-> ne0; OpenBSD has no sunhme driver problem,
+        #     but ne2k_pci is the empirically verified model on pciB),
+        #   * usb=off to match the locally verified config -- OpenBIOS USB
+        #     probing is dead weight on a serial-only machine. NetBSD was
+        #     verified with the default usb=on, so only openbsd gets the
+        #     flag.
+        sparc_mopts = "sun4u"
+        if osname == "openbsd":
+            sparc_mopts += ",usb=off"
+        a += ["-machine", sparc_mopts, "-vga", "none"]
         # NIC model defaults to the onboard sunhme (hme0); a conf may override
         # via VM_NIC (e.g. e1000 -> wm0). Either way it goes on the empty pciB.
         sparc_nic = env("VM_NIC") or "sunhme"
@@ -1337,6 +1393,13 @@ def setup(install_ocr=None):
         if env("VM_ARCH") == "riscv64":
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
                         "qemu-system-misc", "u-boot-qemu"], env=apt_env)
+            # A conf may ship its own QEMU build as a tarball committed in
+            # the builder repo (bin/ + share/qemu layout, built against the
+            # runner's distro libs) -- extract it and point VM_QEMU_BIN at
+            # the extracted binary. The apt qemu-system-misc above still
+            # provides the runtime libs (glib, pixman, slirp, fdt).
+            if env("VM_QEMU_TAR"):
+                _run_quiet(["tar", "--zstd", "-xf", env("VM_QEMU_TAR")])
         if env("VM_ARCH") == "aarch64":
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
                         "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
@@ -1534,6 +1597,8 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
         "monitor 127.0.0.1:%s, serial 127.0.0.1:%s -> %s.serial.log)"
         % (what, poll, max_seconds, vncport, monport, serport, osname))
     elapsed = 0
+    stalled = 0
+    last_size = -1
     while isRunning() == 0:
         time.sleep(poll)
         elapsed += poll
@@ -1548,6 +1613,25 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
             log("%s: guest halted without powering off QEMU; force-killing" % what)
             destroyVM()
             return
+        # Console builds only: the serial log IS the guest console there, so
+        # a shutdown that stops writing to it has stopped making progress.
+        # Empirically (NetBSD 10.1 sparc64): the cmd646 lost-interrupt storm
+        # can wedge BEFORE "syncing disks..." ever prints and then go silent
+        # forever -- the "has halted" banner never comes and the wait would
+        # burn the whole max_seconds. 5 minutes of zero serial growth during
+        # a shutdown means dead, not slow; force-kill right away. (VNC builds
+        # are exempt: their guests console on the emulated VGA and a mute
+        # serial log is normal.)
+        if size != last_size:
+            last_size = size
+            stalled = 0
+        else:
+            stalled += poll
+            if env("VM_USE_CONSOLE_BUILD") and stalled >= 300:
+                log("%s: serial console silent for %d s; force-killing QEMU"
+                    % (what, stalled))
+                destroyVM()
+                return
         if elapsed >= max_seconds:
             log("%s did not power off in %d s; force-killing QEMU"
                 % (what, max_seconds))
@@ -1739,6 +1823,54 @@ def screenTextValue():
     return _screen_text_value()
 
 
+# build.py is one long-lived process, so the dump-dedup state can simply
+# remember everything ever printed across the whole pipeline run.
+_screen_dump_state = {"serial_pos": {}, "ocr_seen": set()}
+
+
+def _unseen_screen_text(screen):
+    """Return only screen text that has not been dumped before in this
+    process.
+
+    Console-build mode ignores `screen` (a 50-line tail window) and instead
+    tracks a byte offset into the serial log, which is append-only and only
+    truncated when launch_qemu() restarts QEMU: every byte gets printed
+    exactly once, bursts longer than the tail window are not lost, and a
+    truncation (size < saved offset) resets the offset so a fresh boot is
+    printed from its first line.
+
+    OCR/VNC mode has no underlying stream, so it dedupes line-wise against
+    every line printed so far: a redraw of an already-shown screen prints
+    nothing, a changed menu prints just its changed lines."""
+    if env("VM_USE_CONSOLE_BUILD"):
+        osname = env("VM_OS_NAME") or "vm"
+        path = serial_log(osname)
+        posmap = _screen_dump_state["serial_pos"]
+        pos = posmap.get(path, 0)
+        try:
+            if os.path.getsize(path) < pos:
+                pos = 0  # log truncated: QEMU was relaunched
+            with open(path, "rb") as f:
+                f.seek(pos)
+                data = f.read()
+        except OSError:
+            return ""
+        posmap[path] = pos + len(data)
+        return data.decode("utf-8", "replace")
+    seen = _screen_dump_state["ocr_seen"]
+    fresh_lines = []
+    for ln in screen.splitlines():
+        # Normalize the dedup key: OCR renders the same physical line with
+        # jittering whitespace from capture to capture, which would make old
+        # lines look new forever. Collapse whitespace runs for the key; the
+        # line itself is printed in its original form.
+        key = " ".join(ln.split())
+        if key and key not in seen:
+            seen.add(key)
+            fresh_lines.append(ln)
+    return "\n".join(fresh_lines)
+
+
 def waitForText(text=None, sec="", hook=None):
     """Poll the screen (VNC OCR or serial-console capture) every 3 s until
     `text` is found in it, or `sec` *wall-clock seconds* elapse. If `hook` is
@@ -1772,8 +1904,16 @@ def waitForText(text=None, sec="", hook=None):
         screen = _screen_text_value(None)
         with open("_screenText.txt", "w") as f:
             f.write(screen)
-        log(""); log("==========screen Text============")
-        log(screen); log("==========screen Text end============")
+        # Dump only what has never been printed before: re-printing the whole
+        # 50-line window every 3 s buried the build log in repetition. The
+        # match below still checks the FULL current screen, so anchors that
+        # scrolled in earlier are unaffected.
+        fresh = _unseen_screen_text(screen)
+        if fresh.strip():
+            log(""); log("==========screen Text============")
+            log(fresh); log("==========screen Text end============")
+        else:
+            log("(no new screen text)")
         if text in screen:
             log("====> OK, found: %s" % text); return 0
         elif env("DEBUG"):
@@ -2448,7 +2588,21 @@ def shutdown_and_wait():
     if not osname: return
     cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=2",
            osname, env("VM_SHUTDOWN_CMD")]
-    rc = subprocess.run(cmd).returncode
+    # The remote shutdown command kills the very connection it runs over, so
+    # this ssh must NOT be awaited unbounded: when the guest tears down sshd
+    # without closing the TCP session (seen on NetBSD/sparc64 when the cmd646
+    # lost-interrupt state makes rc.shutdown crawl), the half-open session
+    # hangs in slirp's hostfwd with no FIN/RST and the ssh client never exits
+    # -- a CI job sat here for 4.5 h without ever reaching the bounded
+    # poweroff wait below. The command itself is delivered and starts running
+    # within seconds, so cap the ssh session; _wait_vm_down() does the real
+    # waiting (VM_SHUTDOWN_MAX_SECONDS + force-kill).
+    try:
+        rc = subprocess.run(cmd, timeout=120).returncode
+    except subprocess.TimeoutExpired:
+        log("shutdown ssh still connected after 120 s; the command was "
+            "delivered, proceeding to the poweroff wait")
+        rc = 0
     if rc != 0:
         log("shutdown rc=%d, ignoring (haiku?)" % rc)
     time.sleep(30)
@@ -2743,17 +2897,60 @@ def main(argv):
         subprocess.run(["ssh", osname, "cat ~/.ssh/id_rsa.pub"], stdout=f)
 
     if env("VM_PRE_INSTALL_PKGS"):
-        cmd = "%s %s" % (env("VM_INSTALL_CMD"), env("VM_PRE_INSTALL_PKGS"))
-        log(cmd)
-        subprocess.run(["ssh", osname, "sh"], input=("set -e\n%s\n" % cmd).encode())
+        inst_script = env("VM_INSTALL_SCRIPT")
+        if inst_script:
+            # Run a conf-provided install script in the guest instead of the
+            # plain "VM_INSTALL_CMD <pkgs>" one-liner. The local script file is
+            # piped into the guest shell over ssh stdin (same transport as
+            # VM_EXTRA_SCRIPT below) with two variables prepended:
+            #   ANYVM_PKGS     - the VM_PRE_INSTALL_PKGS package list
+            #   ANYVM_PKG_PATH - the conf's VM_PKG_PATH (e.g. a host-resolved
+            #                    binary package repo URL), may be empty
+            # First user: NetBSD/sparc64 two-phase pkg install (download the
+            # whole dependency closure into a tmpfs first, then pkg_add from
+            # RAM) to avoid the concurrent net+disk DMA that wedges QEMU
+            # sun4u's CMD646 into its lost-interrupt state.
+            log("install script: %s" % inst_script)
+            with open(inst_script, "r") as f:
+                inst_body = f.read()
+            payload = 'set -e\nANYVM_PKGS="%s"\nANYVM_PKG_PATH="%s"\n%s\n' % (
+                env("VM_PRE_INSTALL_PKGS"), env("VM_PKG_PATH") or "", inst_body)
+            # Relax the client keepalive for this session: ~/.ssh/config (the
+            # enablessh block above) sets ServerAliveInterval=1, i.e. the
+            # client drops the connection after ~3 s without a keepalive
+            # reply. A CPU-heavy install step on a TCG guest (e.g. pkgfetch's
+            # gunzip+awk over a 25k-entry pkg_summary on an emulated sparc64)
+            # starves sshd long enough to trip that, the stdin-fed sh dies
+            # with the connection, and the packages silently never install.
+            # Command-line -o options override ssh_config, so tolerate ~10
+            # minutes of unresponsiveness here.
+            rc = subprocess.run(["ssh", "-o", "ServerAliveInterval=30",
+                                 "-o", "ServerAliveCountMax=20",
+                                 osname, "sh"], input=payload.encode()).returncode
+            if rc != 0:
+                log("install script FAILED rc=%d (packages may be missing)" % rc)
+        else:
+            cmd = "%s %s" % (env("VM_INSTALL_CMD"), env("VM_PRE_INSTALL_PKGS"))
+            log(cmd)
+            rc = subprocess.run(["ssh", "-o", "ServerAliveInterval=30",
+                                 "-o", "ServerAliveCountMax=20",
+                                 osname, "sh"],
+                                input=("set -e\n%s\n" % cmd).encode()).returncode
+            if rc != 0:
+                log("install step FAILED rc=%d (packages may be missing)" % rc)
 
     run_hook("finalize")
 
     extra = env("VM_EXTRA_SCRIPT")
     if extra:
         log(extra)
+        # Same relaxed keepalive as the install step above: a long CPU burst
+        # in the guest must not get the stdin-fed script killed mid-run.
         with open(extra, "rb") as f:
-            subprocess.run(["ssh", "-o", "SendEnv=VM_RELEASE", osname, "sh"], stdin=f)
+            subprocess.run(["ssh", "-o", "SendEnv=VM_RELEASE",
+                            "-o", "ServerAliveInterval=30",
+                            "-o", "ServerAliveCountMax=20",
+                            osname, "sh"], stdin=f)
 
     shutdown_and_wait()
 
