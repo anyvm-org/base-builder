@@ -2573,14 +2573,35 @@ def _wait_ssh(max_retries=100, restart_cb=None):
 def start_and_wait():
     osname = _check_osname("start_and_wait")
     if not osname: return 1
-    if startVM() != 0:
-        log("start_and_wait: startVM failed for %s, aborting" % osname)
-        return 1
-    time.sleep(2); openConsole()
-    if not run_hook("waitForLoginTag"):
-        waitForText(env("VM_LOGIN_TAG"))
-    time.sleep(3)
-    return 0
+    # A boot can die underneath us instead of reaching the login prompt --
+    # a random guest kernel panic (seen: NetBSD 10.0 wm(4) PHY-tick panic
+    # under KVM) or a cmd646-wedged crawl on sparc64 -- and an unbounded
+    # waitForText then polls forever until a human cancels the CI job.
+    # Bound each login wait (VM_LOGIN_MAX_SECONDS, default 600 s) and
+    # reroll the boot (force-kill + relaunch) once before giving up:
+    # panics and wedges are random, so a fresh boot usually clears them.
+    # waitForText returns 0 on both match and timeout by design, so success
+    # is judged by re-checking the current screen for the tag.
+    lmax = int(env("VM_LOGIN_MAX_SECONDS") or 600)
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        if startVM() != 0:
+            log("start_and_wait: startVM failed for %s, aborting" % osname)
+            return 1
+        time.sleep(2); openConsole()
+        if run_hook("waitForLoginTag"):
+            time.sleep(3)
+            return 0
+        waitForText(env("VM_LOGIN_TAG"), str(lmax))
+        if env("VM_LOGIN_TAG") in _screen_text_value(None):
+            time.sleep(3)
+            return 0
+        log("start_and_wait: no login prompt within %d s (attempt %d/%d); "
+            "force-killing for a fresh boot" % (lmax, attempt, attempts))
+        closeConsole()
+        destroyVM()
+    log("start_and_wait: %s never reached the login prompt; aborting" % osname)
+    return 1
 
 
 def shutdown_and_wait():
@@ -2621,7 +2642,7 @@ def shutdown_and_wait():
 
 
 def restart_and_wait():
-    shutdown_and_wait(); start_and_wait()
+    shutdown_and_wait(); return start_and_wait()
 
 
 def _prep_vhd_disk(link):
@@ -2854,7 +2875,9 @@ def main(argv):
     if not env("VM_NO_VNC_BUILD"):
         os.environ["VM_USE_CONSOLE_BUILD"] = ""
 
-    start_and_wait()
+    if start_and_wait() != 0:
+        log("first boot never reached the login prompt; aborting")
+        return 1
     _gen_enablessh_local()
 
     if not run_hook("enablessh"):
@@ -2886,7 +2909,9 @@ def main(argv):
     subprocess.run(["ssh", osname, "sh"], input=ssh_init.encode())
 
     if run_hook("postBuild"):
-        restart_and_wait()
+        if restart_and_wait() != 0:
+            log("post-build reboot never reached the login prompt; aborting")
+            return 1
         if not _wait_ssh():
             log("ssh is failed."); return 1
 
@@ -2979,14 +3004,34 @@ def main(argv):
         log("skip")
     else:
         addSSHAuthorizedKeys("%s-id_rsa.pub" % output)
-        if startVM() != 0:
-            log("verification startVM failed; aborting")
-            return 1
-        while True:
-            ok, _err = _ssh_ready_check()
-            if ok:
+        # Bound this wait: the verification boot can wedge (sparc64 cmd646
+        # crawl) or panic like any other boot, and the old `while True`
+        # spun "not ready yet" forever -- a CI job sat 70+ minutes until a
+        # human cancelled it. Give each boot VM_VERIFY_SSH_MAX_SECONDS
+        # (default 600 s), then reroll once with a fresh QEMU before
+        # giving up.
+        vmax = int(env("VM_VERIFY_SSH_MAX_SECONDS") or 600)
+        verify_ready = False
+        for vattempt in (1, 2):
+            if startVM() != 0:
+                log("verification startVM failed; aborting")
+                return 1
+            vdeadline = time.time() + vmax
+            while time.time() < vdeadline:
+                ok, _err = _ssh_ready_check()
+                if ok:
+                    verify_ready = True
+                    break
+                log("not ready yet, just sleep."); time.sleep(5)
+            if verify_ready:
                 break
-            log("not ready yet, just sleep."); time.sleep(5)
+            log("verification VM not ssh-reachable within %d s "
+                "(attempt %d/2); force-killing for a fresh boot"
+                % (vmax, vattempt))
+            destroyVM()
+        if not verify_ready:
+            log("verification VM never became ssh-reachable; aborting")
+            return 1
         if not _send_env_check():
             return 1
         if osname == "haiku":
