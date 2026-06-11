@@ -92,3 +92,19 @@ jobs:
           {{VM_OS_NAME}}-${{ matrix.os }}.qemu
 
 
+
+
+
+
+
+
+
+
+{{UPLOAD_FILES_JOB}}
+
+
+
+
+
+
+
