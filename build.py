@@ -1308,6 +1308,9 @@ def _profile_sanity_check(profile, cmdline_path):
         if val and val not in cl:
             log("WARNING: guest profile %s=%r not found in launched cmdline "
                 "(build_guest_profile drifted from build_qemu_args?)" % (name, val))
+
+
+def launch_qemu(media_kind=None, media_path=None):
     """Launch QEMU detached so it survives this Python process."""
     osname = env("VM_OS_NAME")
     qbin = resolve_qemu_bin()
