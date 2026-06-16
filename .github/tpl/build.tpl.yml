@@ -68,6 +68,7 @@ jobs:
           {{VM_OS_NAME}}-${{ matrix.os }}-id_rsa.pub
           {{VM_OS_NAME}}-${{ matrix.os }}-host.id_rsa
           {{VM_OS_NAME}}-${{ matrix.os }}.qemu
+          {{VM_OS_NAME}}-${{ matrix.os }}.profile.json
         if-no-files-found: warn
         # qcow2.zst is already maximally compressed; gzip-recompressing the
         # bundle just burns CPU for ~0 savings.
@@ -90,6 +91,7 @@ jobs:
           {{VM_OS_NAME}}-${{ matrix.os }}-id_rsa.pub
           {{VM_OS_NAME}}-${{ matrix.os }}-host.id_rsa
           {{VM_OS_NAME}}-${{ matrix.os }}.qemu
+          {{VM_OS_NAME}}-${{ matrix.os }}.profile.json
 
 
 
