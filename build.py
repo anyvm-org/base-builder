@@ -1614,7 +1614,7 @@ def setup(install_ocr=None):
     """Install host dependencies. Each package-manager step is echoed to the
     log as it starts (and whatever it prints streams live), so a slow or hung
     install is identifiable from the last command shown instead of the phase
-    sitting silent. The apt -qq / pip -q flags stay on, so the log is not
+    sitting silent. The apt -q / pip -q flags stay on, so the log is not
     flooded with per-package chatter -- only the step markers and any errors
     appear. Alias the quiet run-helpers to their loud variants for the length
     of this function so the call sites below need no change."""
@@ -1624,12 +1624,12 @@ def setup(install_ocr=None):
     if is_linux():
         apt_env = dict(os.environ)
         apt_env["DEBIAN_FRONTEND"] = "noninteractive"
-        _run_quiet(["sudo", "-E", "apt-get", "update", "-qq"], env=apt_env)
-        _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+        _run_quiet(["sudo", "-E", "apt-get", "update", "-q"], env=apt_env)
+        _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                     "zstd", "qemu-utils", "qemu-system-x86", "ovmf", "expect",
                     "sshpass", "netcat-openbsd"], env=apt_env)
         if install_ocr:
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                         "tesseract-ocr", "python3-pil",
                         "tesseract-ocr-eng", "tesseract-ocr-script-latn",
                         "python3-opencv", "python3-pip"], env=apt_env)
@@ -1699,16 +1699,16 @@ def setup(install_ocr=None):
             if os.path.exists(vp):
                 _run_quiet(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
         if env("VM_ARCH") == "riscv64":
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                         "qemu-system-misc", "u-boot-qemu"], env=apt_env)
         if env("VM_ARCH") == "aarch64":
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                         "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
         if env("VM_ARCH") == "s390x":
             # qemu-system-s390x ships in its own package on Ubuntu (NOT in
             # qemu-system-misc); its s390-ccw.img firmware comes with the
             # qemu-system-data dependency.
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                         "qemu-system-s390x"], env=apt_env)
         # A conf may ship its own QEMU build as a tarball (bin/ +
         # share/qemu layout, built against the runner's distro libs;
@@ -1724,7 +1724,7 @@ def setup(install_ocr=None):
         if env("VM_ARCH") == "sparc64":
             # qemu-system-sparc64 (sun4u + bundled OpenBIOS) ships in the
             # qemu-system-sparc package; no separate firmware package needed.
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                         "qemu-system-sparc"], env=apt_env)
         if env("VM_ARCH") in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
             # qemu-system-ppc64 (pseries machine) ships in the qemu-system-ppc
@@ -1732,7 +1732,7 @@ def setup(install_ocr=None):
             # with it, so no separate firmware package is needed. The GitHub
             # ubuntu runner image does NOT preinstall this, hence the explicit
             # apt-get (a local dev box may already have it from qemu-system).
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-qq",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                         "qemu-system-ppc"], env=apt_env)
         # Make /dev/kvm usable by the current shell user. On GitHub Actions
         # runners (and most desktop distros) the device is mode crw-rw----
