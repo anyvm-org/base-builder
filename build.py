@@ -1625,11 +1625,11 @@ def setup(install_ocr=None):
         apt_env = dict(os.environ)
         apt_env["DEBIAN_FRONTEND"] = "noninteractive"
         _run_quiet(["sudo", "-E", "apt-get", "update", "-q"], env=apt_env)
-        _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
+        _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                     "zstd", "qemu-utils", "qemu-system-x86", "sshpass",
                     "netcat-openbsd"], env=apt_env)
         if install_ocr:
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "tesseract-ocr", "python3-pil",
                         "tesseract-ocr-eng", "python3-pip"], env=apt_env)
             # Use opencv-python-HEADLESS, not the full opencv-python wheel: the
@@ -1698,16 +1698,16 @@ def setup(install_ocr=None):
             if os.path.exists(vp):
                 _run_quiet(["sudo", "ln", "-sf", vp, "/usr/local/bin/vncdotool"])
         if env("VM_ARCH") == "riscv64":
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-misc", "u-boot-qemu"], env=apt_env)
         if env("VM_ARCH") == "aarch64":
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-arm", "qemu-efi-aarch64"], env=apt_env)
         if env("VM_ARCH") == "s390x":
             # qemu-system-s390x ships in its own package on Ubuntu (NOT in
             # qemu-system-misc); its s390-ccw.img firmware comes with the
             # qemu-system-data dependency.
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-s390x"], env=apt_env)
         # A conf may ship its own QEMU build as a tarball (bin/ +
         # share/qemu layout, built against the runner's distro libs;
@@ -1723,7 +1723,7 @@ def setup(install_ocr=None):
         if env("VM_ARCH") == "sparc64":
             # qemu-system-sparc64 (sun4u + bundled OpenBIOS) ships in the
             # qemu-system-sparc package; no separate firmware package needed.
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-sparc"], env=apt_env)
         if env("VM_ARCH") in ("powerpc64", "powerpc64le", "ppc64", "ppc64le"):
             # qemu-system-ppc64 (pseries machine) ships in the qemu-system-ppc
@@ -1731,7 +1731,7 @@ def setup(install_ocr=None):
             # with it, so no separate firmware package is needed. The GitHub
             # ubuntu runner image does NOT preinstall this, hence the explicit
             # apt-get (a local dev box may already have it from qemu-system).
-            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
+            _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q", "--no-install-recommends",
                         "qemu-system-ppc"], env=apt_env)
         # Make /dev/kvm usable by the current shell user. On GitHub Actions
         # runners (and most desktop distros) the device is mode crw-rw----
