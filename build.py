@@ -96,6 +96,28 @@ def _sh_quiet(cmdstr):
     return r.returncode
 
 
+def _run_loud(cmd, **kw):
+    """Like _run_quiet, but echo the command and let whatever it prints stream
+    straight to our stdout/stderr instead of capturing it. setup() uses this
+    (via a local alias) so each host-dependency step is announced in the log
+    as it starts -- a slow or hung install is then obvious from which command
+    was echoed last, instead of the whole phase sitting silent."""
+    log("setup: + " + " ".join(map(str, cmd)))
+    r = subprocess.run(cmd, **kw)
+    if r.returncode != 0:
+        log("FAILED (rc=%d): %s" % (r.returncode, " ".join(map(str, cmd))))
+    return r
+
+
+def _sh_loud(cmdstr):
+    """Shell-string variant of _run_loud (output streams live)."""
+    log("setup: + " + cmdstr)
+    rc = subprocess.call(cmdstr, shell=True)
+    if rc != 0:
+        log("FAILED (rc=%d): %s" % (rc, cmdstr))
+    return rc
+
+
 def state(osname, suffix):
     return "%s.%s" % (osname, suffix)
 
@@ -1589,9 +1611,16 @@ def closeConsole():
 # ============================================================================
 
 def setup(install_ocr=None):
-    """Install host dependencies. All package-manager output is captured and
-    only printed on failure -- normal runs stay quiet."""
-    log("setup: installing host dependencies (silent unless something fails)")
+    """Install host dependencies. Each package-manager step is echoed to the
+    log as it starts (and whatever it prints streams live), so a slow or hung
+    install is identifiable from the last command shown instead of the phase
+    sitting silent. The apt -qq / pip -q flags stay on, so the log is not
+    flooded with per-package chatter -- only the step markers and any errors
+    appear. Alias the quiet run-helpers to their loud variants for the length
+    of this function so the call sites below need no change."""
+    _run_quiet = _run_loud
+    _sh_quiet = _sh_loud
+    log("setup: installing host dependencies (each step echoed below)")
     if is_linux():
         apt_env = dict(os.environ)
         apt_env["DEBIAN_FRONTEND"] = "noninteractive"
@@ -1621,6 +1650,8 @@ def setup(install_ocr=None):
                 # Use `sys.executable -m pip`, not bare `pip3`: on GitHub
                 # runners pip3 and the python3 running build.py can resolve to
                 # different interpreters / site-packages.
+                log("setup: installing PaddleOCR -- the paddlepaddle wheel is "
+                    "hundreds of MB, expect this step to take a few minutes")
                 if _sh_quiet(pip + " --break-system-packages "
                              "paddlepaddle 'paddleocr>=3.7'") != 0:
                     _sh_quiet(pip + " paddlepaddle 'paddleocr>=3.7'")
