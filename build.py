@@ -1626,13 +1626,12 @@ def setup(install_ocr=None):
         apt_env["DEBIAN_FRONTEND"] = "noninteractive"
         _run_quiet(["sudo", "-E", "apt-get", "update", "-q"], env=apt_env)
         _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
-                    "zstd", "qemu-utils", "qemu-system-x86", "ovmf", "expect",
-                    "sshpass", "netcat-openbsd"], env=apt_env)
+                    "zstd", "qemu-utils", "qemu-system-x86", "sshpass",
+                    "netcat-openbsd"], env=apt_env)
         if install_ocr:
             _run_quiet(["sudo", "-E", "apt-get", "install", "-y", "-q",
                         "tesseract-ocr", "python3-pil",
-                        "tesseract-ocr-eng", "tesseract-ocr-script-latn",
-                        "python3-opencv", "python3-pip"], env=apt_env)
+                        "tesseract-ocr-eng", "python3-pip"], env=apt_env)
             # Use opencv-python-HEADLESS, not the full opencv-python wheel: the
             # full wheel needs libGL.so.1, which headless CI runners (GitHub
             # Actions) lack, so `import cv2` raises ImportError there. cv2 is
