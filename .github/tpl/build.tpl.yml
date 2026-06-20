@@ -90,6 +90,11 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
+        # action-gh-release derives the tag from github.ref by default, but on a
+        # 'release' event github.ref can be refs/heads/<branch> (not a tag), which
+        # fails with "GitHub Releases requires a tag". Pass the tag explicitly:
+        # release event -> github.event.release.tag_name; tag push -> github.ref_name.
+        tag_name: ${{ github.event.release.tag_name || github.ref_name }}
         files: |
           {{VM_OS_NAME}}-${{ matrix.os }}.qcow2.zst*
           {{VM_OS_NAME}}-${{ matrix.os }}-id_rsa.pub
