@@ -80,7 +80,11 @@ jobs:
         # below and lives forever).
         retention-days: 2
     - name: Upload Release Asset
-      if: "contains(github.ref, 'refs/tags/')"
+      # Gate on the event, not github.ref: for a 'release' event github.ref is
+      # NOT guaranteed to be refs/tags/<tag> -- depending on how the release/tag
+      # is created it can come through as refs/heads/<target_commitish> (e.g.
+      # refs/heads/main), which silently skips the upload. event_name is stable.
+      if: "github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')"
       id: upload-release-asset
       uses: softprops/action-gh-release@v3
       env:
