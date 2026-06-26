@@ -3051,6 +3051,12 @@ def _gen_enablessh_local():
         b64 = base64.b64encode(pub.encode("utf-8")).decode("ascii")
         f.write("echo '%s' | openssl base64 -d >>~/.ssh/authorized_keys\n\n\n"
                 % b64)
+        # The base64-roundtrip append above pipes through `openssl base64 -d`,
+        # which does NOT emit a trailing newline, so authorized_keys ends
+        # mid-line. Append one explicit newline right after the key writes so
+        # the file is well-formed (and any key appended later can't concatenate
+        # onto this one's line).
+        f.write("echo >>~/.ssh/authorized_keys\n\n")
         # sshd StrictModes (default) requires .ssh dir 700 + authorized_keys
         # 600. Set both explicitly -- belt-and-suspenders against a buggy
         # `chmod -R 600` in the per-builder enablessh.txt.
@@ -3425,11 +3431,15 @@ def main(argv):
             subprocess.call(["ssh", osname, "ls -lah '$HOME'"])
             log("======Show ssh config: ")
             subprocess.call(["ssh", osname, "cat /boot/system/settings/ssh/sshd_config"])
+            log("======Show authorized_keys: ")
+            subprocess.call(["ssh", osname, "cat ~/.ssh/authorized_keys"])
         else:
             subprocess.call(["ssh", osname, "mkdir -p $HOME/work"])
             subprocess.call(["ssh", osname, "ls -lah $HOME"])
             log("======Show ssh config: ")
             subprocess.call(["ssh", osname, "cat /etc/ssh/sshd_config"])
+            log("======Show authorized_keys: ")
+            subprocess.call(["ssh", osname, "cat ~/.ssh/authorized_keys"])
 
         # Tear down the verification VM so its QEMU process doesn't outlive
         # this build. Otherwise its hostfwd holds VM_SSH_PORT and the next
