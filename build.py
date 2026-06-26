@@ -3441,6 +3441,22 @@ def main(argv):
             log("======Show authorized_keys: ")
             subprocess.call(["ssh", osname, "cat ~/.ssh/authorized_keys"])
 
+        # Verify the shipped image's authorized_keys ends with a trailing
+        # newline. _gen_enablessh_local appends the key a second time through
+        # `openssl base64 -d`, which emits no trailing newline, then an
+        # explicit `echo >>` is meant to terminate the file; assert that held
+        # so a regression can't ship a file ending mid-line. `tail -c1` is the
+        # last byte and `[ -z "$(...)" ]` is true only when it is a newline
+        # (command substitution strips trailing newlines to ""); `-s` rejects
+        # an empty/missing file. Fail the build if the tail is wrong.
+        if subprocess.call(["ssh", osname,
+                            'test -s ~/.ssh/authorized_keys && '
+                            '[ -z "$(tail -c1 ~/.ssh/authorized_keys)" ]']) != 0:
+            log("verification FAILED: ~/.ssh/authorized_keys is empty or does "
+                "not end with a trailing newline")
+            return 1
+        log("verification OK: authorized_keys ends with a trailing newline")
+
         # Tear down the verification VM so its QEMU process doesn't outlive
         # this build. Otherwise its hostfwd holds VM_SSH_PORT and the next
         # build in the same workspace (run locally, or any CI runner reused
