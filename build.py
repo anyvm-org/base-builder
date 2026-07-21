@@ -3439,10 +3439,15 @@ def _gen_enablessh_local():
     pub_path = idrsa + ".pub"
     pub = open(pub_path).read().rstrip("\n")
 
-    try: os.remove(wf("enablessh.local"))
+    # enablessh.local stays at the repo root (NOT under WORKDIR): several
+    # per-builder enablessh hooks read it by bare name -- ghostbsd
+    # `open("enablessh.local")`, blissos/hurd/ubuntu `ssh ... sh <enablessh.local`,
+    # haiku `inputFile("enablessh.local")`. Keeping it at the root avoids
+    # touching every one of those custom hooks. It is small and transient.
+    try: os.remove("enablessh.local")
     except OSError: pass
-    shutil.copy("enablessh.txt", wf("enablessh.local"))
-    with open(wf("enablessh.local"), "a") as f:
+    shutil.copy("enablessh.txt", "enablessh.local")
+    with open("enablessh.local", "a") as f:
         f.write("echo '%s' >>~/.ssh/authorized_keys\n\n\n\n" % pub)
         b64 = base64.b64encode(pub.encode("utf-8")).decode("ascii")
         f.write("echo '%s' | openssl base64 -d >>~/.ssh/authorized_keys\n\n\n"
@@ -3467,7 +3472,7 @@ def _gen_enablessh_local():
         f.write("grep -q '^StrictModes no' /etc/ssh/sshd_config || "
                 "echo 'StrictModes no' >> /etc/ssh/sshd_config\n")
         f.write("chmod u-w /etc/ssh/sshd_config 2>/dev/null || true\n\n\n")
-    log(open(wf("enablessh.local")).read())
+    log(open("enablessh.local").read())
 
 
 def _enable_ssh_root_branch(sshport):
@@ -3476,7 +3481,7 @@ def _enable_ssh_root_branch(sshport):
     (the guest's 192.168.122.x is not host-reachable)."""
     vmip = getVMIP()
     log("guest slirp ip: %s (connecting via hostfwd 127.0.0.1:%s)" % (vmip, sshport))
-    with open(wf("enablessh.local"), "rb") as inp:
+    with open("enablessh.local", "rb") as inp:
         subprocess.run(
             ["sshpass", "-p", env("VM_ROOT_PASSWORD"), "ssh", "-p", str(sshport),
              "-o", "StrictHostKeyChecking=no",
@@ -3514,11 +3519,11 @@ def _enable_ssh_console_branch():
     if run_hook("enableNetwork"):
         screenText(); time.sleep(60)
     if env("VM_USE_NC_ENABLE_SSH"):
-        inputFileNC(wf("enablessh.local"))
+        inputFileNC("enablessh.local")
     elif env("VM_USE_BASH_ENABLE_SSH"):
-        inputFileBash(wf("enablessh.local"))
+        inputFileBash("enablessh.local")
     else:
-        inputFile(wf("enablessh.local"))
+        inputFile("enablessh.local")
     time.sleep(60); screenText(); time.sleep(10)
     inputKeys("enter"); time.sleep(2)
     inputKeys("enter"); time.sleep(2)
