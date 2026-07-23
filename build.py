@@ -2992,8 +2992,18 @@ def processOpts(optsfile=None):
 # ============================================================================
 
 def run_hook(name):
-    """Run a hook. Returns True if any hook ran. Where the hook runs is encoded
-    in the filename prefix:
+    """Run the hooks for a hook point. Returns True if any hook ran.
+
+    BOTH SIDES run when both are present -- guest first, then host:
+
+      hooks/vm_<name>.sh    -- guest-side, piped into the guest's sh via SSH
+                               with SendEnv=VM_RELEASE. Use for in-guest
+                               configuration (service xxx enable, sysrc,
+                               editing /etc/*, installing packages, ...).
+                               Guest hooks are always .sh because the guest
+                               is not guaranteed to have Python. Runs FIRST
+                               so a host hook can build on the configured
+                               guest (e.g. reboot it / rearrange disks).
 
       hooks/host_<name>.py  -- host-side, exec()'d into THIS module's globals.
                                The hook can call build.py functions directly
@@ -3001,25 +3011,35 @@ def run_hook(name):
                                screenText, ...) and see pipeline globals
                                (osname, sshport, opts) as bare names.
                                Use whenever the hook needs the VM-abstraction
-                               API. Lookup precedence #1.
+                               API.
 
       hooks/host_<name>.sh  -- host-side, plain `bash` subprocess. The conf's
                                VM_* env vars are inherited. Use for straight
                                bash tooling on the host that does NOT need
                                build.py functions (virt-customize, qemu-img,
-                               shell glue, ...). Lookup precedence #2.
-
-      hooks/vm_<name>.sh    -- guest-side, piped into the guest's sh via SSH
-                               with SendEnv=VM_RELEASE. Use for in-guest
-                               configuration (service xxx enable, sysrc,
-                               editing /etc/*, installing packages, ...).
-                               Guest hooks are always .sh because the guest
-                               is not guaranteed to have Python. Lookup
-                               precedence #3.
+                               shell glue, ...). Only runs when no host .py
+                               exists -- the two host forms are alternative
+                               implementations of the same host side.
 
     Callers pass the logical hook name (e.g. "installOpts", "postBuild");
-    the prefix lookup is internal."""
+    the prefix lookup is internal. (Until 2026-07 this was a first-match-
+    wins lookup with host taking precedence, so a host hook silently
+    shadowed a same-name guest hook and had to re-pipe it by hand; only
+    netbsd's postBuild pair was affected by the semantic change.)"""
+    ran = False
+    vm_sh = "hooks/vm_%s.sh" % name
+    if os.path.exists(vm_sh):
+        log(vm_sh)
+        with open(vm_sh) as f:
+            log(f.read())
+        with open(vm_sh, "rb") as f:
+            subprocess.run(
+                ["ssh", "-o", "SendEnv=VM_RELEASE",
+                 globals().get("osname") or env("VM_OS_NAME"), "sh"],
+                stdin=f)
+        ran = True
     py = "hooks/host_%s.py" % name
+    host_sh = "hooks/host_%s.sh" % name
     if os.path.exists(py):
         log(py)
         with open(py) as f:
@@ -3028,9 +3048,8 @@ def run_hook(name):
         g = globals()
         g.setdefault("__hookname__", name)
         exec(compile(code, py, "exec"), g)
-        return True
-    host_sh = "hooks/host_%s.sh" % name
-    if os.path.exists(host_sh):
+        ran = True
+    elif os.path.exists(host_sh):
         log(host_sh)
         with open(host_sh) as f:
             log(f.read())
@@ -3043,19 +3062,8 @@ def run_hook(name):
             # Hooks that intend a step to be tolerated must '|| true' it.
             log("FATAL: hook %s exited %d" % (host_sh, rc))
             sys.exit(1)
-        return True
-    vm_sh = "hooks/vm_%s.sh" % name
-    if os.path.exists(vm_sh):
-        log(vm_sh)
-        with open(vm_sh) as f:
-            log(f.read())
-        with open(vm_sh, "rb") as f:
-            subprocess.run(
-                ["ssh", "-o", "SendEnv=VM_RELEASE",
-                 globals().get("osname") or env("VM_OS_NAME"), "sh"],
-                stdin=f)
-        return True
-    return False
+        ran = True
+    return ran
 
 
 def inputKeys(keys):
@@ -3317,8 +3325,11 @@ def _serial_lost_interrupt_count():
 
 def _wait_ssh(max_retries=100, restart_cb=None):
     """Poll ssh through the hostfwd port until reachable; optional restart_cb
-    reboots the guest on failure (up to VM_SSH_MAX_RESTARTS times, default 3
-    -- wedges and panics are random, so a fresh boot usually clears them).
+    reboots the guest on failure, up to VM_SSH_MAX_RESTARTS times (default 1,
+    the historical behavior -- a genuinely broken guest should fail fast).
+    Confs whose boots die RANDOMLY (netbsd 10.x sparc64: cmd646 wedge, where
+    a fresh boot usually clears it and the wedge cutoff below makes each
+    retry cheap) raise it explicitly.
 
     Every retry we ALSO run the layered IP probe (anyvm.py:6100-6118
     "hostfwd guard"): under slirp the guest's DHCP lease should be
@@ -3341,9 +3352,9 @@ def _wait_ssh(max_retries=100, restart_cb=None):
     retry = 0
     restarts = 0
     try:
-        max_restarts = int(env("VM_SSH_MAX_RESTARTS") or 3)
+        max_restarts = int(env("VM_SSH_MAX_RESTARTS") or 1)
     except ValueError:
-        max_restarts = 3
+        max_restarts = 1
     guard_done = False
     # Baseline, not zero: the install phase may legitimately have printed a
     # few 'lost interrupt' lines already -- only NEW lines during this wait
