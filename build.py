@@ -3251,9 +3251,30 @@ def _ssh_verbose_summary(stderr_text, head=20, tail=10):
     return "\n".join(lines[:head] + ["    ... (%d lines trimmed) ..." % (len(lines) - head - tail)] + lines[-tail:])
 
 
+def _serial_lost_interrupt_count():
+    """Count 'lost interrupt' lines in the current QEMU serial log.
+
+    A steadily GROWING count while the guest is invisible on the network is
+    the cmd646-wedge signature (NetBSD 10.x sparc64: QEMU sun4u's CMD646
+    randomly enters a sustained lost-interrupt state, on 8.2.2 and 10.2.3
+    alike -- verified 2026-07-23). Such a guest shows a login: prompt but its
+    disk and NIC are dead: ssh will never come up and a graceful shutdown
+    never completes, so waiting the full probe budget on it is pure waste.
+    Generic on purpose -- any guest spamming 'lost interrupt' with zero
+    network presence is not going to recover on its own."""
+    osname = env("VM_OS_NAME")
+    if not osname: return 0
+    try:
+        with open(serial_log(osname), "rb") as f:
+            return f.read().count(b"lost interrupt")
+    except OSError:
+        return 0
+
+
 def _wait_ssh(max_retries=100, restart_cb=None):
     """Poll ssh through the hostfwd port until reachable; optional restart_cb
-    runs once on terminal failure.
+    reboots the guest on failure (up to VM_SSH_MAX_RESTARTS times, default 3
+    -- wedges and panics are random, so a fresh boot usually clears them).
 
     Every retry we ALSO run the layered IP probe (anyvm.py:6100-6118
     "hostfwd guard"): under slirp the guest's DHCP lease should be
@@ -3274,8 +3295,16 @@ def _wait_ssh(max_retries=100, restart_cb=None):
     except ValueError:
         sshport = 22
     retry = 0
-    restarted = False
+    restarts = 0
+    try:
+        max_restarts = int(env("VM_SSH_MAX_RESTARTS") or 3)
+    except ValueError:
+        max_restarts = 3
     guard_done = False
+    # Baseline, not zero: the install phase may legitimately have printed a
+    # few 'lost interrupt' lines already -- only NEW lines during this wait
+    # indicate the guest wedged underneath us.
+    lost_base = _serial_lost_interrupt_count()
     # Dump ssh -v output every Nth failed retry so we can see WHY ssh
     # failed (auth denied, refused, etc.) without flooding the build log.
     VERBOSE_EVERY = 5
@@ -3307,16 +3336,37 @@ def _wait_ssh(max_retries=100, restart_cb=None):
                         guard_done = True
                     else:
                         log("hostfwd rewrite failed; will retry next iteration")
-        time.sleep(10)
-        retry += 1
-        if retry > max_retries:
-            if restarted or not restart_cb:
+        # Early wedge cutoff: no guest IP anywhere (usernet AND serial both
+        # blank) plus a growing lost-interrupt storm means the guest's disk
+        # and NIC are dead -- probing the remaining budget is pointless, and
+        # a graceful shutdown of such a guest never completes (it burned the
+        # full _wait_vm_down timeout in CI). Force-kill and reroll at once.
+        if (not guard_done and retry >= 6
+                and _serial_lost_interrupt_count() - lost_base >= 3):
+            log("guest looks wedged: lost-interrupt storm on the serial "
+                "console and no guest IP after %d ssh probes" % (retry + 1))
+            if not restart_cb or restarts >= max_restarts:
                 log("ssh is failed."); return False
-            log("ssh failed; trying restart")
-            restarted = True
+            restarts += 1
+            log("force-killing the wedged guest and rebooting "
+                "(restart %d/%d)" % (restarts, max_restarts))
+            destroyVM()
             restart_cb()
             retry = 0
             guard_done = False  # new boot, recheck IP
+            lost_base = _serial_lost_interrupt_count()
+            continue
+        time.sleep(10)
+        retry += 1
+        if retry > max_retries:
+            if restarts >= max_restarts or not restart_cb:
+                log("ssh is failed."); return False
+            restarts += 1
+            log("ssh failed; trying restart (%d/%d)" % (restarts, max_restarts))
+            restart_cb()
+            retry = 0
+            guard_done = False  # new boot, recheck IP
+            lost_base = _serial_lost_interrupt_count()
     return True
 
 
