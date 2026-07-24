@@ -1080,22 +1080,6 @@ def build_qemu_args(media_kind=None, media_path=None):
         a += ["-device", "%s,netdev=net0,bus=pciB" % sparc_nic]
         # Main disk on IDE primary master -> wd0. qcow2 rides the cmd646 fine.
         a += ["-drive", "file=%s,format=qcow2,if=ide,index=0" % qcow]
-        # Optional second disk on a PCI SCSI HBA, placed AFTER the NIC so the
-        # controller lands on pciB dev 1 (the locally verified topology).
-        # Used by NetBSD 10.x sparc64's cmd646-wedge bypass: the migration
-        # hook (netbsd-builder hooks/host_postBuild.py) creates the file
-        # mid-pipeline and moves the root filesystem onto it (guest sd0);
-        # attachment is gated on the file existing, so the install phase and
-        # any build without the hook are unaffected. mptsas1068 is the ONLY
-        # SCSI model both QEMU emulates and NetBSD/sparc64 GENERIC drives
-        # correctly (lsi53c895a: esiop interrupt loop; am53c974: broken READ
-        # CAPACITY; nvme/ahci: no sparc64 driver; virtio: unusable on sun4u).
-        xdisk = env("VM_EXTRA_DISK")
-        if xdisk and os.path.exists(wf(xdisk)):
-            xdev = env("VM_EXTRA_DISK_DEVICE") or "mptsas1068"
-            a += ["-device", "%s,id=anyscsi0,bus=pciB" % xdev]
-            a += ["-drive", "file=%s,format=qcow2,if=none,id=xdisk0" % wf(xdisk)]
-            a += ["-device", "scsi-hd,drive=xdisk0,bus=anyscsi0.0"]
         if media_kind == "cdrom":
             # Install DVD on IDE secondary master -> cd0; boot from it.
             a += ["-drive", "file=%s,format=raw,if=ide,index=2,media=cdrom" % media_path]
@@ -1500,15 +1484,6 @@ def build_guest_profile():
         "transport": "telnet" if env("VM_TRANSPORT") == "telnet" else "ssh",
         "mem_cap_mb": mem_cap,
         "cpu_cap": cpu_cap,
-        # Hybrid two-disk layout (NetBSD 10.x sparc64): when boot_disk is
-        # true, the MAIN qcow2 asset is the root disk and attaches as a
-        # scsi-hd behind `scsi_controller` (on pciB), while a separate
-        # <image>-boot.qcow2.zst asset (bootblock + ofwboot + kernel) goes on
-        # disk_if (IDE index 0) purely to be booted from. Both None/false on
-        # every classic single-disk image.
-        "scsi_controller": ((env("VM_EXTRA_DISK_DEVICE") or "mptsas1068")
-                            if env("VM_EXTRA_DISK") else None),
-        "boot_disk": bool(env("VM_EXTRA_DISK")),
     }
 
 
@@ -2697,18 +2672,7 @@ def exportOVA(ova=None, qemu_args=None):
     if not ova:
         log("Usage: exportOVA out.qcow2 [out.qemu]"); return 1
     src = wf("%s.qcow2" % osname)
-    xdisk = env("VM_EXTRA_DISK")
-    if xdisk and os.path.exists(wf(xdisk)):
-        # Hybrid two-disk layout (NetBSD 10.x sparc64 cmd646-wedge bypass):
-        # the MAIN asset <output>.qcow2.zst is the ROOT disk (VM_EXTRA_DISK,
-        # guest sd0 on the SCSI HBA) and the small IDE boot disk (bootblock +
-        # ofwboot + kernel only, never mounted at runtime) ships beside it as
-        # <output>-boot.qcow2.zst. anyvm.py learns the layout from the
-        # profile's boot_disk / scsi_controller keys.
-        _export_disk(wf(xdisk), ova)
-        _export_disk(src, re.sub(r"\.qcow2$", "-boot.qcow2", ova))
-    else:
-        _export_disk(src, ova)
+    _export_disk(src, ova)
     if qemu_args:
         cl = state(osname, "cmdline")
         if os.path.exists(cl):
