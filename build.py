@@ -2184,6 +2184,7 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
     elapsed = 0
     stalled = 0
     last_size = -1
+    poweroff_ack = False   # guest printed a shutdown/poweroff ack (see below)
     while isRunning() == 0:
         time.sleep(poll)
         elapsed += poll
@@ -2200,6 +2201,19 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
             log("%s: guest halted without powering off QEMU; force-killing" % what)
             destroyVM()
             return
+        # Latch a shutdown/poweroff ACK. NetBSD sparc64's `shutdown -p` prints
+        # "poweroff by root:" and then, on sun4u, sometimes HALTS without ever
+        # printing the "has halted" banner above and without QEMU exiting --
+        # the serial just goes silent on that line (seen 2026-07-25: a 10.0
+        # build sat ~5 min in the generic silent cutoff below). Once the ack
+        # is seen, a SHORT spell of serial silence means the guest finished
+        # syncing and halted: a still-syncing guest keeps writing progress
+        # (which resets `stalled`), so 60 s of dead-silence AFTER the ack is a
+        # safe "it's down" signal -- force-kill then instead of waiting the
+        # full 300 s. The ack gate makes this fire only on a genuine shutdown.
+        if re.search(r"poweroff by root|shutdown:.*poweroff|Powering off",
+                     tail, re.I):
+            poweroff_ack = True
         # Console builds only: the serial log IS the guest console there, so
         # a shutdown that stops writing to it has stopped making progress.
         # Empirically (NetBSD 10.1 sparc64): the cmd646 lost-interrupt storm
@@ -2214,6 +2228,11 @@ def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
             stalled = 0
         else:
             stalled += poll
+            if poweroff_ack and stalled >= 60:
+                log("%s: guest acknowledged poweroff and serial silent %d s; "
+                    "force-killing QEMU" % (what, stalled))
+                destroyVM()
+                return
             if env("VM_USE_CONSOLE_BUILD") and stalled >= 300:
                 log("%s: serial console silent for %d s; force-killing QEMU"
                     % (what, stalled))
