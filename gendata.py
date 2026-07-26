@@ -51,9 +51,9 @@ def source_conf(path):
     # build.py's conf_load, and print the variables gendata needs.
     script = (
         '. "$1" >/dev/null 2>&1; '
-        'printf "%s\n%s\n%s\n%s\n%s\n" '
+        'printf "%s\n%s\n%s\n%s\n%s\n%s\n" '
         '"$VM_OS_NAME" "$VM_RELEASE" "$VM_ARCH" '
-        '"$VM_SYNC_METHODS" "$VM_EXTRA_SCRIPT"'
+        '"$VM_SYNC_METHODS" "$VM_EXTRA_SCRIPT" "$VM_SHUTDOWN_CMD"'
     )
     p = subprocess.run(["bash", "-c", script, "bash", path],
                        capture_output=True, text=True,
@@ -61,7 +61,7 @@ def source_conf(path):
     if p.returncode != 0:
         fatal("sourcing %s failed: %s" % (path, p.stderr.strip()))
     vals = p.stdout.split("\n")
-    if len(vals) < 5:
+    if len(vals) < 6:
         fatal("sourcing %s produced no output" % path)
     return {
         "os_name": vals[0].strip(),
@@ -69,6 +69,7 @@ def source_conf(path):
         "arch": vals[2].strip(),
         "sync": vals[3].strip(),
         "extra_script": vals[4].strip(),
+        "shutdown_cmd": vals[5].strip(),
     }
 
 
@@ -97,6 +98,7 @@ def scan_confs():
             "release": v["release"],
             "arch": arch,
             "sync": v["sync"],
+            "shutdown": v["shutdown_cmd"],
             "desktop": bool(v["extra_script"]),
         })
     if not entries:
@@ -155,6 +157,7 @@ def render_releases_json(os_name, entries, notes):
             "release": e["release"],
             "arch": e["arch"],
             "sync": e["sync"],
+            "shutdown": e["shutdown"],
             "desktop": e["desktop"],
             "build": e["tag"] not in notes["no_build"],
         })

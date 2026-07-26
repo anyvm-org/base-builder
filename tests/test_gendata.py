@@ -16,7 +16,8 @@ def write(path, content):
         f.write(content)
 
 
-def conf_text(os_name, release, arch="", sync="rsync,scp", extra=""):
+def conf_text(os_name, release, arch="", sync="rsync,scp", extra="",
+              shutdown=""):
     lines = ['VM_OS_NAME="%s"' % os_name, "VM_RELEASE=%s" % release]
     if arch:
         lines.append("VM_ARCH=%s" % arch)
@@ -24,6 +25,8 @@ def conf_text(os_name, release, arch="", sync="rsync,scp", extra=""):
         lines.append('VM_SYNC_METHODS="%s"' % sync)
     if extra:
         lines.append('VM_EXTRA_SCRIPT="%s"' % extra)
+    if shutdown:
+        lines.append('VM_SHUTDOWN_CMD="%s"' % shutdown)
     return "\n".join(lines) + "\n"
 
 
@@ -95,6 +98,17 @@ class TestScanConfs(GendataCase):
         os_name, entries = gendata.scan_confs()
         self.assertFalse(entries[0]["desktop"])
 
+    def test_shutdown_cmd_captured(self):
+        self.add("demo-1.0.conf",
+                 conf_text("demo", "1.0", shutdown="shutdown -p now"))
+        os_name, entries = gendata.scan_confs()
+        self.assertEqual(entries[0]["shutdown"], "shutdown -p now")
+
+    def test_shutdown_cmd_empty_by_default(self):
+        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
+        os_name, entries = gendata.scan_confs()
+        self.assertEqual(entries[0]["shutdown"], "")
+
 
 class TestOrdering(GendataCase):
     def test_all_release_ordering(self):
@@ -135,8 +149,29 @@ class TestOrdering(GendataCase):
         self.assertEqual(data["os"], "demo")
         self.assertEqual(data["releases"][0], {
             "tag": "1.0", "release": "1.0", "arch": "x86_64",
-            "sync": "nfs,scp", "desktop": False, "build": True})
+            "sync": "nfs,scp", "shutdown": "", "desktop": False,
+            "build": True})
         self.assertTrue(data["releases"][1]["desktop"])
+
+    def test_releases_json_shutdown_field(self):
+        self.add("demo-1.0.conf",
+                 conf_text("demo", "1.0", sync="nfs,scp",
+                           shutdown="shutdown -p now"))
+        os_name, entries = gendata.scan_confs()
+        notes = gendata.parse_notes()
+        text = gendata.render_releases_json(os_name, entries, notes)
+        data = json.loads(text)
+        self.assertEqual(data["releases"][0], {
+            "tag": "1.0", "release": "1.0", "arch": "x86_64",
+            "sync": "nfs,scp", "shutdown": "shutdown -p now",
+            "desktop": False, "build": True})
+        # Key order matters for readable diffs: "shutdown" must sit
+        # between "sync" and "desktop" in the raw JSON text.
+        sync_idx = text.index('"sync"')
+        shutdown_idx = text.index('"shutdown"')
+        desktop_idx = text.index('"desktop"')
+        self.assertLess(sync_idx, shutdown_idx)
+        self.assertLess(shutdown_idx, desktop_idx)
 
 
 NOTES_SAMPLE = (
