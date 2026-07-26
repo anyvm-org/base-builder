@@ -2139,13 +2139,13 @@ def _serial_tail_line(window=4096):
     return size, last
 
 
-def _wait_vm_down(what="VM", poll=20, max_seconds=1800):
+def _wait_vm_down(what="VM", poll=20, max_seconds=600):
     """Block until isRunning() reports not-running. Every poll prints a one-
     line status: elapsed time, size of <osname>.serial.log, and the last non-
     empty line of the guest console -- so it's obvious whether the install is
     making progress or stuck.
 
-    After max_seconds (default 1800 = 30 min) without the VM going down, we
+    After max_seconds (default 600 = 10 min) without the VM going down, we
     force-kill the QEMU process via destroyVM() and return. This caps the
     blast radius when a guest ignores the ACPI shutdown request -- before
     the cap, FreeBSD 13.5 aarch64 sat at its login: prompt and burned the
@@ -3416,12 +3416,12 @@ def start_and_wait():
     # a random guest kernel panic (seen: NetBSD 10.0 wm(4) PHY-tick panic
     # under KVM) or a cmd646-wedged crawl on sparc64 -- and an unbounded
     # waitForText then polls forever until a human cancels the CI job.
-    # Bound each login wait (VM_LOGIN_MAX_SECONDS, default 600 s) and
+    # Bound each login wait (VM_LOGIN_MAX_SECONDS, default 300 s) and
     # reroll the boot (force-kill + relaunch) once before giving up:
     # panics and wedges are random, so a fresh boot usually clears them.
     # waitForText returns 0 on both match and timeout by design, so success
     # is judged by re-checking the current screen for the tag.
-    lmax = int(env("VM_LOGIN_MAX_SECONDS") or 600)
+    lmax = int(env("VM_LOGIN_MAX_SECONDS") or 300)
     attempts = 2
     for attempt in range(1, attempts + 1):
         if startVM() != 0:
@@ -3456,7 +3456,7 @@ def shutdown_and_wait():
         if isRunning() == 0:
             if shutdownVM() != 0:
                 log("shutdown error")
-        smax = int(env("VM_SHUTDOWN_MAX_SECONDS") or 1800)
+        smax = int(env("VM_SHUTDOWN_MAX_SECONDS") or 600)
         _wait_vm_down(what="VM shutdown", poll=5, max_seconds=smax)
         closeConsole()
         return
@@ -3489,7 +3489,7 @@ def shutdown_and_wait():
     # final `shutdown -p` sync crawls (each command times out ~10s). Give it
     # enough time to reach "has halted" cleanly -- a premature force-kill mid-
     # sync can corrupt the root FFS and drop the verify VM to single-user.
-    smax = int(env("VM_SHUTDOWN_MAX_SECONDS") or 1800)
+    smax = int(env("VM_SHUTDOWN_MAX_SECONDS") or 600)
     _wait_vm_down(what="VM shutdown", poll=5, max_seconds=smax)
     closeConsole()
 
