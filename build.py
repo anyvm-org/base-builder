@@ -34,6 +34,7 @@ import threading
 import time
 import platform
 import urllib.request
+import zipfile
 
 HOME = os.path.expanduser("~")
 HOST_ARCH = platform.machine()
@@ -3497,6 +3498,32 @@ def restart_and_wait():
     shutdown_and_wait(); return start_and_wait()
 
 
+def _unzip_single_img(zpath, img):
+    """Extract the one raw *.img member of a zip archive to `img`.
+
+    Returns False (leaving no partial `img` behind) when the archive is
+    unreadable/corrupt or does not hold exactly one .img member, so the
+    caller can re-download once before giving up. Streams the member in 1 MB
+    chunks -- these images are ~4 GB uncompressed and must never be read into
+    memory whole."""
+    try:
+        with zipfile.ZipFile(zpath) as z:
+            members = [m for m in z.namelist() if m.endswith(".img")]
+            if len(members) != 1:
+                log("zip %s holds %d .img members (expected exactly 1): %s"
+                    % (zpath, len(members), members))
+                return False
+            log("extracting %s from %s" % (members[0], zpath))
+            with z.open(members[0]) as src, open(img, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+        return True
+    except (zipfile.BadZipFile, OSError, EOFError) as e:
+        log("zip extract of %s failed: %s" % (zpath, e))
+        try: os.remove(img)
+        except OSError: pass
+        return False
+
+
 def _prep_vhd_disk(link):
     """Materialize $osname.qcow2 from a published cloud image URL."""
     osname = env("VM_OS_NAME")
@@ -3549,6 +3576,33 @@ def _prep_vhd_disk(link):
                 except OSError: pass
                 download(link, tarball)
                 must_sh(tarcmd, "tar extract %s (corrupt download?)" % tarball)
+        must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                  "-o", "preallocation=off", img, qcow], "qemu-img convert")
+    elif link.endswith("img.zip"):
+        # Zip archive holding a single raw *.img member whose name carries a
+        # per-build timestamp (NextBSD publishes
+        # NextBSD-amd64-20260724-211803.img.zip and refreshes it on every
+        # push, so the member name can never be spelled out in a conf).
+        # Extract by suffix instead. Python's zipfile is used rather than
+        # unzip(1) so no extra host package is needed on any platform.
+        # The extracted .img is KEPT (same retry-cache semantics as the
+        # img.gz / img.tar.gz branches): clearVM() deletes the qcow2 on every
+        # run, so removing the .img would force a full re-download on each
+        # rebuild attempt.
+        img = wf("%s.img" % osname)
+        if not os.path.exists(img):
+            zpath = wf("%s.imgzip" % osname)
+            # Reuse an existing archive (a prior run's download survives a
+            # clearVM). If it is absent or turns out corrupt, (re)download
+            # once and extract again -- that second failure is fatal.
+            if not os.path.exists(zpath) or not _unzip_single_img(zpath, img):
+                try: os.remove(zpath)
+                except OSError: pass
+                download(link, zpath)
+                if not _unzip_single_img(zpath, img):
+                    log("FATAL: cannot extract a raw .img from %s "
+                        "(corrupt download?)" % zpath)
+                    sys.exit(1)
         must_run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
                   "-o", "preallocation=off", img, qcow], "qemu-img convert")
     elif link.endswith(".img"):
