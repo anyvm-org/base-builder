@@ -40,6 +40,7 @@ jobs:
             base-builder/.github/tpl/manual.tpl.yml : .github/workflows/manual.yml
             base-builder/.github/FUNDING.yml : .github/FUNDING.yml
             base-builder/.github/workflows/readme.yml : .github/workflows/readme.yml
+            base-builder/.github/workflows/rerun.yml : .github/workflows/rerun.yml
             base-builder/build.py : build.py
 
       - name: Commit and push changes
@@ -48,6 +49,7 @@ jobs:
           git config user.name "Generate.yml"
           git add \
             .github/workflows/readme.yml \
+            .github/workflows/rerun.yml \
             .github/workflows/manual.yml \
             .github/workflows/build.yml \
             .github/tpl/README.tpl.md \
