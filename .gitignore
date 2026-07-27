@@ -1,0 +1,4 @@
+# Python bytecode caches, created whenever gendata.py / watch.py run or
+# a builder's hooks/upstream_check.py imports gendata from here.
+__pycache__/
+*.pyc

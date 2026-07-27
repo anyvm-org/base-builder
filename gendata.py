@@ -109,10 +109,15 @@ def scan_confs():
 def natural_key(s):
     key = []
     for tok in re.split(r"[.\-_]", s):
-        if tok.isdigit():
-            key.append((0, int(tok), ""))
-        else:
-            key.append((1, 0, tok.lower()))
+        # Split a mixed token like "r1beta10" into ["r", "1", "beta", "10"]
+        # so the digit runs compare as numbers. Comparing the whole token
+        # as a string ranks r1beta10 BELOW r1beta5, which would make the
+        # upstream watcher decide "not newer" and go silently stale.
+        for part in re.findall(r"\d+|\D+", tok):
+            if part.isdigit():
+                key.append((0, int(part), ""))
+            else:
+                key.append((1, 0, part.lower()))
     return key
 
 
@@ -183,6 +188,7 @@ def parse_notes():
         "footnote_ids": set(),
         "shelved": set(),
         "no_build": set(),
+        "url_templates": {},
     }
     if not os.path.exists(NOTES_PATH):
         return notes
@@ -208,6 +214,11 @@ def parse_notes():
                     fatal("notes: bad arch-label directive: %r" % line)
                 arch, label = val.split("=", 1)
                 notes["arch_labels"][arch.strip()] = label.strip()
+            elif key == "url-template":
+                if "=" not in val:
+                    fatal("notes: bad url-template directive: %r" % line)
+                var, tpl = val.split("=", 1)
+                notes["url_templates"][var.strip()] = tpl.strip()
             elif key == "release-label":
                 notes["release_label"] = val
             elif key == "extra-column":

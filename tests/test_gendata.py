@@ -138,6 +138,22 @@ class TestOrdering(GendataCase):
         self.assertLess(gendata.natural_key("9.4"),
                         gendata.natural_key("10.0"))
 
+    def test_natural_sort_mixed_alpha_digit_tokens(self):
+        # these schemes glue digits onto letters; comparing the token as a
+        # string ranks r1beta10 below r1beta5 and would make the upstream
+        # watcher go silently stale
+        for lo, hi in (("r1beta5", "r1beta10"),
+                       ("0m40", "0m100"),
+                       ("24.03-LTS-SP4", "24.03-LTS-SP10"),
+                       ("r151058", "r1511000")):
+            self.assertLess(gendata.natural_key(lo), gendata.natural_key(hi),
+                            "%s should sort before %s" % (lo, hi))
+
+    def test_natural_sort_plain_numeric_unchanged(self):
+        for lo, hi in (("9.4", "10.0"), ("15.1", "15.10"),
+                       ("22.03-LTS-SP4", "24.03-LTS-SP4")):
+            self.assertLess(gendata.natural_key(lo), gendata.natural_key(hi))
+
     def test_releases_json(self):
         self.add("demo-1.0.conf", conf_text("demo", "1.0", sync="nfs,scp"))
         self.add("demo-1.0-xfce.conf",
@@ -207,6 +223,14 @@ class TestNotes(GendataCase):
         self.assertEqual(notes["release_label"], "Release (BlissOS)")
         self.assertEqual(notes["extra_columns"], ["Android"])
         self.assertEqual(notes["extra_values"], {("Android", "16"): "13"})
+
+    def test_url_template_directive(self):
+        write(gendata.NOTES_PATH,
+              "<!-- url-template: VM_ISO_LINK = "
+              "https://x/{V}/install{VC}.iso -->\n")
+        notes = gendata.parse_notes()
+        self.assertEqual(notes["url_templates"],
+                         {"VM_ISO_LINK": "https://x/{V}/install{VC}.iso"})
 
 
 class TestRenderTable(GendataCase):
