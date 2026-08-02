@@ -121,8 +121,27 @@ def watch_base(entry, bases):
     return max(cands, key=len) if cands else rel
 
 
+def _rc_token_re(version):
+    """The version pinned to release-candidate media: '11.0_RC7' or
+    '11.0-RC7' style, exactly for this version."""
+    return re.compile(re.escape(version) + r"[_-]RC\d+")
+
+
+def _conf_urls(os_name, tag):
+    """The URL-key values of one conf file, read fresh from disk."""
+    path = os.path.join(gendata.CONF_DIR, "%s-%s.conf" % (os_name, tag))
+    urls = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = ASSIGN_RE.match(line.rstrip("\n"))
+            if m and m.group(2) in URL_KEYS:
+                urls.append(_strip_quotes(m.group(3))[0])
+    return urls
+
+
 def decide(os_name, entries, notes, version):
-    """Return (action, template_release). action is "none" or "new"."""
+    """Return (action, arg). action is "none", "new" (arg = template
+    release) or "refresh" (arg = version whose confs pin RC media)."""
     if not version:
         return ("none", None)
     # Exact match only: notes["shelved"]/notes["no_build"] hold conf TAGS,
@@ -139,6 +158,22 @@ def decide(os_name, entries, notes, version):
     for e in entries:
         if (e["release"] == version or gendata.base_release(e) == version
                 or watch_base(e, reals) == version):
+            # The version is covered -- but maybe by RELEASE-CANDIDATE
+            # media. netbsd kept 11.0 in RC status so long that its confs
+            # pinned the 11.0_RC7 URLs; when the final NetBSD-11.0/
+            # directory appeared, "already has a conf" silently ignored
+            # it. The hook only reports FINAL releases, so a hook version
+            # whose conf URLs still carry an RC token means the final
+            # media now exists and the URLs must move.
+            rc = _rc_token_re(version)
+            stale = [x["tag"] for x in entries
+                     if gendata.base_release(x) == version
+                     and any(rc.search(u) for u in
+                             _conf_urls(os_name, x["tag"]))]
+            if stale:
+                log("%s conf(s) still pin RC media (%s), refreshing"
+                    % (version, ", ".join(stale)))
+                return ("refresh", version)
             log("%s already has a conf, nothing to do" % version)
             return ("none", None)
     # Shelved entries are excluded from the template candidates too -- a
@@ -426,6 +461,55 @@ def check_companions(plan):
     return bad
 
 
+def plan_refresh(os_name, entries, version):
+    """Rewrite RC-media URLs to the final release's, in place.
+
+    Same-named files, URL-key lines only: the RC token
+    ('<version>[_-]RC<n>') collapses to the bare version and every other
+    byte of the conf survives -- a non-URL value that merely LOOKS like
+    an RC reference is data, not a pin. Companion files referenced by
+    the conf get the same token collapsed at non-alnum boundaries when
+    they carry it (netbsd's answer files match on version-free installer
+    text, so in practice only comments move). Confs whose URLs are
+    already final produce no plan item, which is what makes the action
+    idempotent -- the day after a refresh lands, decide() reports plain
+    "already has a conf".
+    """
+    rc = _rc_token_re(version)
+    plan = []
+    for e in entries:
+        if gendata.base_release(e) != version:
+            continue
+        path = os.path.join(gendata.CONF_DIR,
+                            "%s-%s.conf" % (os_name, e["tag"]))
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        out_lines, urls, url_pairs, hit = [], [], [], False
+        for line in text.splitlines(True):
+            m = ASSIGN_RE.match(line.rstrip("\r\n"))
+            if m and m.group(2) in URL_KEYS:
+                indent, key, raw = m.group(1), m.group(2), m.group(3)
+                value, quote = _strip_quotes(raw)
+                newval = rc.sub(version, value)
+                if newval != value:
+                    hit = True
+                    eol = "\r\n" if line.endswith("\r\n") else "\n"
+                    line = "%s%s=%s%s%s%s" % (indent, key, quote, newval,
+                                              quote, eol)
+                    # only the CHANGED urls enter the gates: a second URL
+                    # key without an RC token is legitimately unchanged
+                    # here, and check_urls_moved would misread it
+                    url_pairs.append((key, value, newval))
+                    urls.append(newval)
+            out_lines.append(line)
+        if hit:
+            plan.append({"path": path, "content": "".join(out_lines),
+                         "urls": urls, "url_pairs": url_pairs,
+                         "source": path, "companion_key": None,
+                         "leftovers": []})
+    return plan
+
+
 def check_filenames(os_name, plan):
     """Re-derive each planned conf's filename from its own content.
 
@@ -629,10 +713,19 @@ def main(argv=None):
     if action == "none":
         return 0
 
-    plan = plan_files(os_name, entries, notes, template, version)
-    if not plan:
-        fatal("nothing to replicate from %s" % template)
-    log("modelling %s on %s (%d file(s))" % (version, template, len(plan)))
+    if action == "refresh":
+        plan = plan_refresh(os_name, entries, version)
+        if not plan:
+            log("nothing to refresh after all")
+            return 0
+        log("refreshing %d conf(s) from RC to final %s media"
+            % (len(plan), version))
+    else:
+        plan = plan_files(os_name, entries, notes, template, version)
+        if not plan:
+            fatal("nothing to replicate from %s" % template)
+        log("modelling %s on %s (%d file(s))"
+            % (version, template, len(plan)))
 
     # The watcher workflow commits with `git add conf`, so anything written
     # elsewhere would be created on the runner, never committed, and leave

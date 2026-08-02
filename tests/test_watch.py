@@ -226,6 +226,92 @@ class TestRealBases(WatchCase):
                          set(["22.03-LTS-SP4", "24.03-LTS-SP1"]))
 
 
+class TestRefresh(WatchCase):
+    """netbsd's RC trap, the other side: the confs already exist for the
+    hook-reported version, but their URLs still pin the RC media. When
+    the FINAL directory appears the watcher must move the URLs, not say
+    'already has a conf, nothing to do'."""
+
+    RC_URL = "https://x/pub/N/N-11.0_RC7/images/N-11.0_RC7-amd64.iso"
+    FINAL_URL = "https://x/pub/N/N-11.0/images/N-11.0-amd64.iso"
+
+    def _load(self):
+        gendata = __import__("gendata")
+        os_name, entries = gendata.scan_confs()
+        notes = gendata.parse_notes()
+        return os_name, entries, notes
+
+    def test_decide_reports_refresh_for_rc_urls(self):
+        self.add("demo-11.0.conf",
+                 conf_text("demo", "11.0", url=self.RC_URL))
+        os_name, entries, notes = self._load()
+        self.assertEqual(watch.decide(os_name, entries, notes, "11.0"),
+                         ("refresh", "11.0"))
+
+    def test_decide_is_noop_once_urls_are_final(self):
+        self.add("demo-11.0.conf",
+                 conf_text("demo", "11.0", url=self.FINAL_URL))
+        os_name, entries, notes = self._load()
+        self.assertEqual(watch.decide(os_name, entries, notes, "11.0")[0],
+                         "none")
+
+    def test_plan_rewrites_only_url_lines(self):
+        text = conf_text("demo", "11.0", url=self.RC_URL,
+                         extra='VM_LOGIN_TAG="RC7 lookalike stays"')
+        self.add("demo-11.0.conf", text)
+        os_name, entries, notes = self._load()
+        plan = watch.plan_refresh(os_name, entries, "11.0")
+        self.assertEqual(len(plan), 1)
+        item = plan[0]
+        self.assertTrue(item["path"].endswith("demo-11.0.conf"))
+        self.assertIn(self.FINAL_URL, item["content"])
+        self.assertNotIn("11.0_RC7", item["content"].split("VM_LOGIN")[0])
+        # a non-URL value keeps its RC-looking text
+        self.assertIn('VM_LOGIN_TAG="RC7 lookalike stays"', item["content"])
+        self.assertEqual(item["urls"], [self.FINAL_URL])
+
+    def test_conf_without_rc_url_is_not_planned(self):
+        self.add("demo-11.0.conf",
+                 conf_text("demo", "11.0", url=self.FINAL_URL))
+        self.add("demo-11.0-aarch64.conf",
+                 conf_text("demo", "11.0", arch="aarch64", url=self.RC_URL))
+        os_name, entries, notes = self._load()
+        plan = watch.plan_refresh(os_name, entries, "11.0")
+        self.assertEqual([os.path.basename(p["path"]) for p in plan],
+                         ["demo-11.0-aarch64.conf"])
+
+    def test_main_refresh_writes_and_is_head_gated(self):
+        self.add("demo-11.0.conf",
+                 conf_text("demo", "11.0", url=self.RC_URL))
+        self.hook('print("11.0")')
+        watch._TEST_OPENER = FakeOpener({self.FINAL_URL: 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main([]), 0)
+        data = open("conf/demo-11.0.conf", encoding="utf-8").read()
+        self.assertIn(self.FINAL_URL, data)
+        self.assertNotIn("11.0_RC7", data)
+
+    def test_main_refresh_aborts_on_dead_final_url(self):
+        self.add("demo-11.0.conf",
+                 conf_text("demo", "11.0", url=self.RC_URL))
+        self.hook('print("11.0")')
+        watch._TEST_OPENER = FakeOpener({})   # final URL 404s
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main([]), 1)
+        data = open("conf/demo-11.0.conf", encoding="utf-8").read()
+        self.assertIn("11.0_RC7", data)      # untouched
+
+    def test_check_mode_refresh_writes_nothing(self):
+        self.add("demo-11.0.conf",
+                 conf_text("demo", "11.0", url=self.RC_URL))
+        self.hook('print("11.0")')
+        watch._TEST_OPENER = FakeOpener({self.FINAL_URL: 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--check"]), 0)
+        self.assertIn("11.0_RC7",
+                      open("conf/demo-11.0.conf", encoding="utf-8").read())
+
+
 class TestSubstitute(unittest.TestCase):
     def test_compress_strips_punctuation(self):
         self.assertEqual(watch.compress("7.9"), "79")
