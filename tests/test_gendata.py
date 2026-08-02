@@ -67,6 +67,23 @@ class TestScanConfs(GendataCase):
         self.assertTrue(by_tag["15.1-xfce"]["desktop"])
         self.assertFalse(by_tag["15.1"]["desktop"])
 
+    def test_network_fetchers_are_stubbed_out_during_sourcing(self):
+        # netbsd's confs deliberately run $(curl ...) in VM_INSTALL_CMD /
+        # VM_PKG_PATH (resolving the pkgsrc redirect on the HOST is the
+        # design). gendata never reads those keys, but sourcing evaluates
+        # them -- 20 real curls against ftp.netbsd.org made every Step 2
+        # and watch run ~70s slower. The sourcing env must neuter curl
+        # and wget to instant no-ops.
+        self.add("demo-14.4.conf",
+                 conf_text("demo", "14.4")
+                 + 'VM_INSTALL_CMD="PKG_PATH=$(curl -sL http://x/) pkg"\n'
+                 + 'PROBE="pre$(curl -sL whatever)post$(wget -q -O- y)end"\n'
+                 + 'VM_SHUTDOWN_CMD="shutdown -p $PROBE"\n')
+        os_name, entries = gendata.scan_confs()
+        # the stub yields empty output and exit 0, so the value that DID
+        # embed a fetch collapses cleanly instead of hanging or erroring
+        self.assertEqual(entries[0]["shutdown"], "shutdown -p prepostend")
+
     def test_hyphenated_release(self):
         self.add("demo-22.03-LTS-SP4-aarch64.conf",
                  conf_text("demo", "22.03-LTS-SP4", arch="aarch64"))

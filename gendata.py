@@ -46,9 +46,39 @@ def warn(msg):
     sys.stderr.write("gendata: WARNING: %s\n" % msg)
 
 
+_STUB_BIN = None
+
+
+def _stub_bin():
+    """A PATH prefix whose curl/wget are instant no-ops.
+
+    Sourcing a conf EXECUTES its command substitutions, and netbsd's
+    confs deliberately run $(curl ...) in VM_INSTALL_CMD / VM_PKG_PATH
+    (resolving the pkgsrc redirect on the HOST is the design -- build.py
+    keeps the real curl for that). gendata never reads those keys, yet
+    the 20 real curls against ftp.netbsd.org made every generate.yml
+    Step 2, every watch run and every local --check ~70s slower. If a
+    key gendata DOES read ever embedded a fetch, the stub collapses it
+    to an empty string and the filename/emptiness validation catches
+    that loudly rather than silently scanning stale network data.
+    """
+    global _STUB_BIN
+    if _STUB_BIN is None:
+        import tempfile
+        d = tempfile.mkdtemp(prefix="gendata-stub-")
+        for name in ("curl", "wget"):
+            p = os.path.join(d, name)
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(p, 0o755)
+        _STUB_BIN = d
+    return _STUB_BIN
+
+
 def source_conf(path):
     # Source the conf with bash, cwd = repo root, exactly like
     # build.py's conf_load, and print the variables gendata needs.
+    # PATH is prefixed with the no-op curl/wget stubs -- see _stub_bin.
     script = (
         '. "$1" >/dev/null 2>&1; '
         'printf "%s\n%s\n%s\n%s\n%s\n%s\n" '
@@ -57,7 +87,8 @@ def source_conf(path):
     )
     p = subprocess.run(["bash", "-c", script, "bash", path],
                        capture_output=True, text=True,
-                       env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+                       env={"PATH": _stub_bin() + os.pathsep
+                            + os.environ.get("PATH", "/usr/bin:/bin")})
     if p.returncode != 0:
         fatal("sourcing %s failed: %s" % (path, p.stderr.strip()))
     vals = p.stdout.split("\n")
