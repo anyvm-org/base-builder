@@ -840,6 +840,60 @@ class TestMain(WatchCase):
             "ALL_RELEASES='\"15.1\", \"15.1-aarch64\", "
             "\"15.2\", \"15.2-aarch64\"'\n")
 
+    def test_replace_mode_swaps_the_membership(self):
+        # 9front's shape: publishing the new image DELETES the old one,
+        # so plan9's membership file declares ALL_RELEASES_UPDATE=replace
+        # and the superseded release leaves the matrix in the same commit
+        # -- the build never sees an unbuildable release.
+        self.add("demo-11554.conf", conf_text(
+            "demo", "11554", url="https://x/iso/demo-11554.qcow2.gz"))
+        write("conf/all.release.conf",
+              "ALL_RELEASES='\"11554\"'\n"
+              "ALL_RELEASES_UPDATE=replace\n")
+        self.hook('print("11952")')
+        watch._TEST_OPENER = FakeOpener(
+            {"https://x/iso/demo-11952.qcow2.gz": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main([]), 0)
+        text = open("conf/all.release.conf", encoding="utf-8").read()
+        self.assertEqual(text,
+                         "ALL_RELEASES='\"11952\"'\n"
+                         "ALL_RELEASES_UPDATE=replace\n")
+
+    def test_default_mode_appends_and_keeps_the_old_release(self):
+        # freebsd's shape: old media stays published; no mode line means
+        # append, the old release keeps building
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1.img"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"15.1\"'\n")
+        self.hook('print("15.2")')
+        watch._TEST_OPENER = FakeOpener({"https://x/15.2.img": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main([]), 0)
+        text = open("conf/all.release.conf", encoding="utf-8").read()
+        self.assertEqual(text, "ALL_RELEASES='\"15.1\", \"15.2\"'\n")
+
+    def test_unknown_update_mode_is_fatal(self):
+        write("conf/all.release.conf",
+              "ALL_RELEASES='\"1\"'\nALL_RELEASES_UPDATE=rolling\n")
+        with self.assertRaises(SystemExit):
+            watch.membership_update_mode()
+
+    def test_replace_mode_check_prints_and_writes_nothing(self):
+        self.add("demo-11554.conf", conf_text(
+            "demo", "11554", url="https://x/iso/demo-11554.qcow2.gz"))
+        write("conf/all.release.conf",
+              "ALL_RELEASES='\"11554\"'\n"
+              "ALL_RELEASES_UPDATE=replace\n")
+        self.hook('print("11952")')
+        watch._TEST_OPENER = FakeOpener(
+            {"https://x/iso/demo-11952.qcow2.gz": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--check"]), 0)
+        text = open("conf/all.release.conf", encoding="utf-8").read()
+        self.assertIn('"11554"', text)
+        self.assertNotIn('"11952"', text)
+
     def test_check_mode_does_not_touch_membership(self):
         self.add("demo-15.1.conf", conf_text(
             "demo", "15.1", url="https://x/15.1.img"))

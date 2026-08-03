@@ -515,6 +515,64 @@ def plan_refresh(os_name, entries, version):
     return plan
 
 
+def remove_membership(tags):
+    """Switch tags OFF: drop them from the ALL_RELEASES line. Same
+    single-line, EOL-preserving discipline as append_membership."""
+    path = gendata.MEMBERSHIP_PATH
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.read().splitlines(True)
+    for i, line in enumerate(lines):
+        if not gendata.ALL_RELEASES_RE.match(line):
+            continue
+        present = re.findall(r'"([^"]+)"', line)
+        gone = [t for t in present if t in set(tags)]
+        if not gone:
+            return []
+        kept = [t for t in present if t not in set(tags)]
+        eol = "\r\n" if line.endswith("\r\n") else "\n"
+        lines[i] = ("ALL_RELEASES='%s'%s"
+                    % (", ".join('"%s"' % t for t in kept), eol))
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("".join(lines))
+        return gone
+    return []
+
+
+UPDATE_MODE_RE = re.compile(r"^\s*ALL_RELEASES_UPDATE=(\S+)\s*$")
+
+
+def membership_update_mode():
+    """How the watcher evolves the membership on a new release:
+    "append" (default -- archiving upstreams like freebsd keep old media,
+    old releases keep building) or "replace" (rolling upstreams like
+    9front DELETE the old media when publishing the new one, so the
+    superseded release must leave the matrix in the same commit or the
+    next build goes red on a 404).
+
+    Configured per builder by an `ALL_RELEASES_UPDATE=replace` line in
+    conf/all.release.conf itself -- the switch lives next to the list it
+    governs, in conf/ (the user's rule: switches live in conf/, never in
+    .github/data/). The file is shell-sourced by generate.yml, so the
+    extra assignment is harmless there; gendata only reads the
+    ALL_RELEASES line. An unknown value is fatal, not a silent default.
+    """
+    path = gendata.MEMBERSHIP_PATH
+    if not os.path.exists(path):
+        return "append"
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = UPDATE_MODE_RE.match(line)
+            if m:
+                mode = m.group(1)
+                if mode not in ("append", "replace"):
+                    fatal("%s: ALL_RELEASES_UPDATE=%s is not append|replace"
+                          % (path, mode))
+                return mode
+    return "append"
+
+
 def append_membership(tags):
     """Switch the newly landed tags ON: append them to the ALL_RELEASES
     line of conf/all.release.conf. The file is the hand-owned build
@@ -833,14 +891,29 @@ def main(argv=None):
             (os.path.basename(p["path"])[len(os_name) + 1:-len(".conf")]
              for p in plan if p["path"].endswith(".conf")),
             key=gendata.natural_key)
+        mode = membership_update_mode()
+        old_tags = ([e["tag"] for e in entries
+                     if gendata.base_release(e) == template
+                     and e["tag"] in set(membership or [])]
+                    if mode == "replace" else [])
         if args.check:
             log("would append to all.release.conf: %s"
                 % ", ".join('"%s"' % t for t in new_tags))
+            if old_tags:
+                log("would remove from all.release.conf "
+                    "(ALL_RELEASES_UPDATE=replace): %s"
+                    % ", ".join('"%s"' % t for t in old_tags))
         else:
             added = append_membership(new_tags)
             if added:
                 log("all.release.conf += %s"
                     % ", ".join('"%s"' % t for t in added))
+            if old_tags:
+                gone = remove_membership(old_tags)
+                if gone:
+                    log("all.release.conf -= %s "
+                        "(ALL_RELEASES_UPDATE=replace)"
+                        % ", ".join('"%s"' % t for t in gone))
     if allow:
         log("suggested coverage.allow lines (apply in the anyvm repo):")
         for line in allow:
