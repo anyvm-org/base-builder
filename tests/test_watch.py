@@ -894,6 +894,46 @@ class TestMain(WatchCase):
         self.assertIn('"11554"', text)
         self.assertNotIn('"11952"', text)
 
+    def test_landed_out_written_on_landing(self):
+        # the workflow turns this file into the "upstream release landed"
+        # notification issue -- without it a landing is silent and the
+        # maintainer never learns a tag cut is wanted (midnightbsd 4.0.7
+        # landed on 2026-08-01 and nobody noticed)
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1.img"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"15.1\"'\n")
+        self.hook('print("15.2")')
+        watch._TEST_OPENER = FakeOpener({"https://x/15.2.img": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--landed-out", "landed.txt"]), 0)
+        self.assertEqual(open("landed.txt", encoding="utf-8").read(),
+                         "new 15.2\n")
+
+    def test_landed_out_written_on_refresh(self):
+        self.add("demo-11.0.conf", conf_text(
+            "demo", "11.0",
+            url="https://x/N-11.0_RC7/N-11.0_RC7-amd64.iso"))
+        self.hook('print("11.0")')
+        watch._TEST_OPENER = FakeOpener(
+            {"https://x/N-11.0/N-11.0-amd64.iso": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--landed-out", "landed.txt"]), 0)
+        self.assertEqual(open("landed.txt", encoding="utf-8").read(),
+                         "refresh 11.0\n")
+
+    def test_landed_out_absent_on_noop_and_check(self):
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1.img"))
+        self.hook('print("15.1")')
+        self.assertEqual(watch.main(["--landed-out", "landed.txt"]), 0)
+        self.assertFalse(os.path.exists("landed.txt"))
+        self.hook('print("15.2")')
+        watch._TEST_OPENER = FakeOpener({"https://x/15.2.img": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--check", "--landed-out",
+                                     "landed.txt"]), 0)
+        self.assertFalse(os.path.exists("landed.txt"))
+
     def test_check_mode_does_not_touch_membership(self):
         self.add("demo-15.1.conf", conf_text(
             "demo", "15.1", url="https://x/15.1.img"))

@@ -788,6 +788,11 @@ def main(argv=None):
                     help="write the suggested coverage.allow lines here, "
                          "so the workflow can put them in the commit "
                          "message (nothing is written when there are none)")
+    ap.add_argument("--landed-out",
+                    help="write '<action> <version>' here after a "
+                         "successful landing, so the workflow can open the "
+                         "notification issue (never written on --check or "
+                         "a no-op run)")
     args = ap.parse_args(argv)
     if not os.path.isdir(gendata.CONF_DIR):
         fatal("no conf/ directory here; run from a builder repo root")
@@ -922,6 +927,15 @@ def main(argv=None):
             with open(args.allow_out, "w", encoding="utf-8",
                       newline="\n") as f:
                 f.write("\n".join(allow) + "\n")
+    if args.landed_out and not args.check:
+        # A silent success is a miss too: midnightbsd 4.0.7 landed and
+        # built green on 2026-08-01 and the maintainer never heard about
+        # it, although cutting the builder release tag (the ONE remaining
+        # human action) was now wanted. The workflow turns this file into
+        # a notification issue.
+        with open(args.landed_out, "w", encoding="utf-8",
+                  newline="\n") as f:
+            f.write("%s %s\n" % (action, version))
     return 0
 
 
