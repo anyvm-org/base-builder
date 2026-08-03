@@ -144,14 +144,14 @@ def decide(os_name, entries, notes, version):
     release) or "refresh" (arg = version whose confs pin RC media)."""
     if not version:
         return ("none", None)
-    # Exact match only: notes["shelved"]/notes["no_build"] hold conf TAGS,
-    # which may carry an arch/variant suffix (e.g. "7.9-xfce-aarch64").
-    # A shelved VARIANT must not suppress the whole release -- only that
-    # one tag is hidden, and plan_files() already skips shelved variants
-    # individually when replicating. Matching a bare version as a prefix
-    # of a suffixed tag used to treat "16.0-aarch64 shelved" as "16.0
-    # already covered", which wrongly refused the entire 16.0 release.
-    if version in notes["shelved"] or version in notes["no_build"]:
+    # Exact match only: notes["shelved"] holds conf TAGS, which may carry
+    # an arch/variant suffix (e.g. "7.9-xfce-aarch64"). A shelved VARIANT
+    # must not suppress the whole release -- only that one tag is hidden,
+    # and plan_files() already skips shelved variants individually when
+    # replicating. Matching a bare version as a prefix of a suffixed tag
+    # used to treat "16.0-aarch64 shelved" as "16.0 already covered",
+    # which wrongly refused the entire 16.0 release.
+    if version in notes["shelved"]:
         log("%s is listed in table.notes.md, nothing to do" % version)
         return ("none", None)
     reals = real_bases(entries)
@@ -286,20 +286,25 @@ def _looks_like_repo_path(v):
         "/" not in v and v.endswith((".txt", ".resp", ".sh", ".opts")))
 
 
-def plan_files(os_name, entries, notes, old, new):
+def plan_files(os_name, entries, notes, old, new, membership=None):
     """Build the list of files to write for release `new`, modelled on
-    every conf of release `old`. Never writes anything."""
+    every conf of release `old`. Never writes anything.
+
+    `membership` is conf/all.release.conf's tag list (None = every conf
+    builds, the bare-fixture fallback). A template conf that is shelved
+    OR switched off there is not replicated: the maintainer turned that
+    image off, and the new tag would silently switch it back on.
+    """
     plan, extra_copies = [], []
     reals = real_bases(entries)
+    member = (set(membership) if membership is not None
+              else set(e["tag"] for e in entries))
     for e in entries:
         if watch_base(e, reals) != old:
             continue
-        # shelved: hidden everywhere; no-build: deliberately out of the
-        # build matrix. Replicating either onto the new release silently
-        # switches it back on, because the NEW tag is on neither list.
-        if e["tag"] in notes["shelved"] or e["tag"] in notes["no_build"]:
-            log("%s-%s.conf is shelved or no-build, not replicating"
-                % (os_name, e["tag"]))
+        if e["tag"] in notes["shelved"] or e["tag"] not in member:
+            log("%s-%s.conf is shelved or switched off in "
+                "all.release.conf, not replicating" % (os_name, e["tag"]))
             continue
         src = os.path.join(gendata.CONF_DIR,
                            "%s-%s.conf" % (os_name, e["tag"]))
@@ -508,6 +513,41 @@ def plan_refresh(os_name, entries, version):
                          "source": path, "companion_key": None,
                          "leftovers": []})
     return plan
+
+
+def append_membership(tags):
+    """Switch the newly landed tags ON: append them to the ALL_RELEASES
+    line of conf/all.release.conf. The file is the hand-owned build
+    switch (user rule: switches live in conf/), so this touches ONLY that
+    one line, preserves its EOL, and appends at the end of the list --
+    hand-curated order is left alone. Returns the tags actually added."""
+    path = gendata.MEMBERSHIP_PATH
+    if not os.path.exists(path):
+        warn("%s missing; cannot switch new tags on" % path)
+        return []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.read().splitlines(True)
+    for i, line in enumerate(lines):
+        if not gendata.ALL_RELEASES_RE.match(line):
+            continue
+        present = set(re.findall(r'"([^"]+)"', line))
+        todo = [t for t in dict.fromkeys(tags) if t not in present]
+        if not todo:
+            return []
+        eol = "\r\n" if line.endswith("\r\n") else "\n"
+        body = line.rstrip("\r\n")
+        if not body.endswith("'"):
+            warn("%s: ALL_RELEASES line does not end with a quote; "
+                 "not touching it -- add %s by hand"
+                 % (path, ", ".join(todo)))
+            return []
+        lines[i] = (body[:-1] + ", "
+                    + ", ".join('"%s"' % t for t in todo) + "'" + eol)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("".join(lines))
+        return todo
+    warn("%s has no ALL_RELEASES= line; add the new tags by hand" % path)
+    return []
 
 
 def check_filenames(os_name, plan):
@@ -721,7 +761,9 @@ def main(argv=None):
         log("refreshing %d conf(s) from RC to final %s media"
             % (len(plan), version))
     else:
-        plan = plan_files(os_name, entries, notes, template, version)
+        membership = gendata.parse_membership()
+        plan = plan_files(os_name, entries, notes, template, version,
+                          membership)
         if not plan:
             fatal("nothing to replicate from %s" % template)
         log("modelling %s on %s (%d file(s))"
@@ -784,6 +826,21 @@ def main(argv=None):
         with open(item["path"], "w", encoding="utf-8", newline="\n") as f:
             f.write(item["content"])
         log("wrote %s" % item["path"])
+    if action == "new":
+        # Switch the landed tags ON in the hand-owned membership file --
+        # without this the confs exist but never enter the build matrix.
+        new_tags = sorted(
+            (os.path.basename(p["path"])[len(os_name) + 1:-len(".conf")]
+             for p in plan if p["path"].endswith(".conf")),
+            key=gendata.natural_key)
+        if args.check:
+            log("would append to all.release.conf: %s"
+                % ", ".join('"%s"' % t for t in new_tags))
+        else:
+            added = append_membership(new_tags)
+            if added:
+                log("all.release.conf += %s"
+                    % ", ".join('"%s"' % t for t in added))
     if allow:
         log("suggested coverage.allow lines (apply in the anyvm repo):")
         for line in allow:

@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # gendata.py -- derive every release-list surface of an <os>-builder
-# repo from its conf/*.conf files (the single source of truth).
+# repo from its conf/ files (the single source of truth).
+#
+# Hand-owned inputs (the control layer, all under conf/ -- user rule:
+# switches live in conf/, .github/data/ holds passive outputs only):
+#   conf/<rel>[-<arch>].conf     one per release/arch (the inventory)
+#   conf/all.release.conf        ALL_RELEASES -- WHICH confs build (the
+#                                switch; a conf absent from this list is
+#                                documented but not built)
+# Hand-owned presentation input: .github/data/table.notes.md (footnotes,
+# cosmetic labels, extra columns, shelved rows, url templates -- nothing
+# in it changes what builds).
 #
 # Generated files (all overwritten in place):
-#   conf/all.release.conf        ALL_RELEASES build matrix
 #   .github/data/table.md        main release table (README render input)
 #   .github/data/desktop.md      desktop-variant table (only if desktop confs)
-#   .github/data/releases.json   machine-readable index
-#
-# Hand-owned optional input: .github/data/table.notes.md (footnotes for
-# absent release/arch combos, cosmetic labels, extra columns).
+#   .github/data/releases.json   machine-readable index ("build" mirrors
+#                                all.release.conf membership)
 #
 # Run from a builder repo root:
 #   python3 /path/to/base-builder/gendata.py [--check]
@@ -180,12 +187,40 @@ def order_key(entry):
             variant(entry))
 
 
+MEMBERSHIP_PATH = os.path.join(CONF_DIR, "all.release.conf")
+ALL_RELEASES_RE = re.compile(r"^\s*ALL_RELEASES=")
+
+
 def render_all_release(entries):
+    """The canonical text for a freshly seeded membership file. NOT a
+    generated output any more -- all.release.conf is the hand-owned build
+    switch (see the header); this helper only exists for bootstrapping a
+    brand-new repo and for the watcher's append formatting."""
     tags = [e["tag"] for e in sorted(entries, key=order_key)]
     return "ALL_RELEASES='%s'\n" % ", ".join('"%s"' % t for t in tags)
 
 
-def render_releases_json(os_name, entries, notes):
+def parse_membership():
+    """The hand-maintained build membership from conf/all.release.conf.
+
+    Returns an ordered tag list, or None when the file is absent (bare
+    test fixtures; every real repo has one) -- callers treat None as
+    "every conf builds" and warn.
+    """
+    if not os.path.exists(MEMBERSHIP_PATH):
+        warn("%s missing; treating every conf as buildable"
+             % MEMBERSHIP_PATH)
+        return None
+    with open(MEMBERSHIP_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            if ALL_RELEASES_RE.match(line):
+                return re.findall(r'"([^"]+)"', line)
+    fatal("%s has no ALL_RELEASES= line" % MEMBERSHIP_PATH)
+
+
+def render_releases_json(os_name, entries, notes, membership=None):
+    member = (set(membership) if membership is not None
+              else set(e["tag"] for e in entries))
     releases = []
     for e in sorted(entries, key=order_key):
         releases.append({
@@ -195,7 +230,7 @@ def render_releases_json(os_name, entries, notes):
             "sync": e["sync"],
             "shutdown": e["shutdown"],
             "desktop": e["desktop"],
-            "build": e["tag"] not in notes["no_build"],
+            "build": e["tag"] in member,
         })
     return json.dumps({"os": os_name, "releases": releases},
                       indent=2) + "\n"
@@ -218,7 +253,6 @@ def parse_notes():
         "raw": "",
         "footnote_ids": set(),
         "shelved": set(),
-        "no_build": set(),
         "url_templates": {},
     }
     if not os.path.exists(NOTES_PATH):
@@ -265,7 +299,12 @@ def parse_notes():
             elif key == "shelved":
                 notes["shelved"].add(val)
             elif key == "no-build":
-                notes["no_build"].add(val)
+                # The build switch moved OUT of the notes (user rule:
+                # switches live in conf/, data/ is passive): a conf
+                # builds IFF its tag is listed in conf/all.release.conf.
+                fatal("notes: the no-build directive is gone -- remove "
+                      "%r and instead leave the tag out of "
+                      "conf/all.release.conf" % line)
             else:
                 fatal("notes: unknown directive %r" % line)
             continue
@@ -377,23 +416,28 @@ def generated_outputs():
     if unknown_shelved:
         fatal("notes: shelved tag(s) not found among conf entries: %s"
               % ", ".join(sorted(unknown_shelved)))
-    unknown_no_build = notes["no_build"] - all_tags
-    if unknown_no_build:
-        fatal("notes: no-build tag(s) not found among conf entries: %s"
-              % ", ".join(sorted(unknown_no_build)))
+    membership = parse_membership()
+    if membership is not None:
+        unknown_members = set(membership) - all_tags
+        if unknown_members:
+            fatal("%s lists tag(s) with no conf file: %s"
+                  % (MEMBERSHIP_PATH, ", ".join(sorted(unknown_members))))
+        shelved_members = set(membership) & notes["shelved"]
+        if shelved_members:
+            fatal("%s lists shelved tag(s): %s -- a shelved conf must not "
+                  "build" % (MEMBERSHIP_PATH,
+                             ", ".join(sorted(shelved_members))))
     # shelved: dropped from every output (kept on disk, undocumented).
+    # A conf ABSENT from all.release.conf stays documented (its table row
+    # and releases.json entry remain, with "build": false) -- the
+    # membership file only switches the build off.
     active_entries = [e for e in entries if e["tag"] not in notes["shelved"]]
-    # no-build: dropped from the build matrix only -- still documented in
-    # table.md/desktop.md/releases.json (with releases.json "build": false).
-    build_entries = [e for e in active_entries
-                     if e["tag"] not in notes["no_build"]]
     outputs = {
-        os.path.join(CONF_DIR, "all.release.conf"):
-            render_all_release(build_entries),
         os.path.join(DATA_DIR, "table.md"):
             render_table(active_entries, notes),
         os.path.join(DATA_DIR, "releases.json"):
-            render_releases_json(os_name, active_entries, notes),
+            render_releases_json(os_name, active_entries, notes,
+                                 membership),
     }
     desktop = render_desktop(os_name, active_entries, notes)
     if desktop is not None:

@@ -334,17 +334,15 @@ class TestRenderDesktop(GendataCase):
 
 
 class TestShelved(GendataCase):
-    # shelved: <tag> -- dropped from ALL FOUR outputs (kept on disk,
-    # undocumented; the original "no-build" semantics before NEW-1 split
-    # them into shelved vs no-build).
-    def test_shelved_removed_from_all_release_and_json(self):
+    # shelved: <tag> -- dropped from every generated output (kept on
+    # disk, undocumented). Presentation-only since the build switch moved
+    # to conf/all.release.conf; gendata additionally refuses a shelved
+    # tag that is still listed there (see TestMembership).
+    def test_shelved_removed_from_json(self):
         self.add("demo-1.0.conf", conf_text("demo", "1.0"))
         self.add("demo-2.0.conf", conf_text("demo", "2.0"))
         write(gendata.NOTES_PATH, "<!-- shelved: 1.0 -->\n")
         outputs = gendata.generated_outputs()
-        all_release = outputs[os.path.join("conf", "all.release.conf")]
-        self.assertNotIn('"1.0"', all_release)
-        self.assertIn('"2.0"', all_release)
         data = json.loads(
             outputs[os.path.join(".github", "data", "releases.json")])
         tags = [r["tag"] for r in data["releases"]]
@@ -392,34 +390,21 @@ class TestShelved(GendataCase):
         self.assertIn("15.1-gnome", desktop)
 
 
-class TestNoBuild(GendataCase):
-    # no-build: <tag> -- dropped from ALL_RELEASES only. Still documented:
-    # table.md/desktop.md keep a normal check+sync cell, and releases.json
-    # keeps the entry but with "build": false (all other entries get
-    # "build": true). Models "documented and tested elsewhere, but not
-    # built by this repo's own matrix".
-    def test_no_build_excluded_from_all_release_only(self):
-        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
-        self.add("demo-2.0.conf", conf_text("demo", "2.0"))
-        write(gendata.NOTES_PATH, "<!-- no-build: 1.0 -->\n")
-        outputs = gendata.generated_outputs()
-        all_release = outputs[os.path.join("conf", "all.release.conf")]
-        self.assertNotIn('"1.0"', all_release)
-        self.assertIn('"2.0"', all_release)
+class TestMembership(GendataCase):
+    # conf/all.release.conf is the HAND-OWNED build switch (user rule:
+    # switches live in conf/, .github/data/ holds passive outputs). A
+    # conf absent from it is documented -- table row and releases.json
+    # entry stay -- but carries "build": false and never enters the
+    # matrix. gendata READS the file; it never writes it.
+    def _members(self, *tags):
+        write(gendata.MEMBERSHIP_PATH,
+              "ALL_RELEASES='%s'\n"
+              % ", ".join('"%s"' % t for t in tags))
 
-    def test_no_build_still_renders_in_table(self):
+    def test_membership_controls_the_build_field(self):
         self.add("demo-1.0.conf", conf_text("demo", "1.0"))
         self.add("demo-2.0.conf", conf_text("demo", "2.0"))
-        write(gendata.NOTES_PATH, "<!-- no-build: 1.0 -->\n")
-        outputs = gendata.generated_outputs()
-        table = outputs[os.path.join(".github", "data", "table.md")]
-        self.assertIn("| 1.0 | \u2705 (rsync,scp) |", table)
-        self.assertIn("| 2.0 | \u2705 (rsync,scp) |", table)
-
-    def test_no_build_json_build_field(self):
-        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
-        self.add("demo-2.0.conf", conf_text("demo", "2.0"))
-        write(gendata.NOTES_PATH, "<!-- no-build: 1.0 -->\n")
+        self._members("2.0")
         outputs = gendata.generated_outputs()
         data = json.loads(
             outputs[os.path.join(".github", "data", "releases.json")])
@@ -427,18 +412,55 @@ class TestNoBuild(GendataCase):
         self.assertFalse(by_tag["1.0"]["build"])
         self.assertTrue(by_tag["2.0"]["build"])
 
-    def test_unknown_no_build_tag_fatal(self):
+    def test_switched_off_conf_still_renders_in_table(self):
         self.add("demo-1.0.conf", conf_text("demo", "1.0"))
-        write(gendata.NOTES_PATH, "<!-- no-build: 9.9 -->\n")
+        self.add("demo-2.0.conf", conf_text("demo", "2.0"))
+        self._members("2.0")
+        outputs = gendata.generated_outputs()
+        table = outputs[os.path.join(".github", "data", "table.md")]
+        self.assertIn("| 1.0 | \u2705 (rsync,scp) |", table)
+        self.assertIn("| 2.0 | \u2705 (rsync,scp) |", table)
+
+    def test_membership_file_is_never_a_generated_output(self):
+        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
+        self._members("1.0")
+        outputs = gendata.generated_outputs()
+        self.assertNotIn(gendata.MEMBERSHIP_PATH, outputs)
+
+    def test_missing_file_means_everything_builds(self):
+        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
+        outputs = gendata.generated_outputs()
+        data = json.loads(
+            outputs[os.path.join(".github", "data", "releases.json")])
+        self.assertTrue(data["releases"][0]["build"])
+
+    def test_unknown_member_tag_fatal(self):
+        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
+        self._members("1.0", "9.9")
         with self.assertRaises(SystemExit):
             gendata.generated_outputs()
+
+    def test_shelved_member_fatal(self):
+        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
+        self.add("demo-2.0.conf", conf_text("demo", "2.0"))
+        self._members("1.0", "2.0")
+        write(gendata.NOTES_PATH, "<!-- shelved: 1.0 -->\n")
+        with self.assertRaises(SystemExit):
+            gendata.generated_outputs()
+
+    def test_no_build_directive_is_a_loud_migration_error(self):
+        self.add("demo-1.0.conf", conf_text("demo", "1.0"))
+        write(gendata.NOTES_PATH, "<!-- no-build: 1.0 -->\n")
+        with self.assertRaises(SystemExit):
+            gendata.parse_notes()
 
 
 class TestMain(GendataCase):
     def test_write_then_check(self):
         self.add("demo-1.0.conf", conf_text("demo", "1.0"))
         self.assertEqual(gendata.main([]), 0)
-        self.assertTrue(os.path.exists("conf/all.release.conf"))
+        # the membership file is hand-owned; gendata must NEVER create it
+        self.assertFalse(os.path.exists("conf/all.release.conf"))
         self.assertTrue(os.path.exists(".github/data/table.md"))
         self.assertTrue(os.path.exists(".github/data/releases.json"))
         self.assertFalse(os.path.exists(".github/data/desktop.md"))

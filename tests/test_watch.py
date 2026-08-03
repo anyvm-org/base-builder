@@ -422,18 +422,20 @@ class TestPlanFiles(WatchCase):
         names = sorted(os.path.basename(p["path"]) for p in plan)
         self.assertEqual(names, ["demo-8.0.conf"])
 
-    def test_no_build_variant_is_not_replicated(self):
-        # no-build: means the maintainer took that image OUT of the build
-        # matrix. Replicating it onto the new release would put it back
-        # in, because the new tag is not on the no-build list.
+    def test_switched_off_variant_is_not_replicated(self):
+        # a conf absent from all.release.conf is switched off; the
+        # maintainer took that image out of the matrix, and replicating
+        # it onto the new release would silently put it back
         self.add("demo-7.9.conf", conf_text("demo", "7.9"))
         self.add("demo-7.9-aarch64.conf",
                  conf_text("demo", "7.9", arch="aarch64"))
-        write(__import__("gendata").NOTES_PATH,
-              "<!-- no-build: 7.9-aarch64 -->\n")
+        write(__import__("gendata").MEMBERSHIP_PATH,
+              "ALL_RELEASES='\"7.9\"'\n")
         os_name, entries = __import__("gendata").scan_confs()
         notes = __import__("gendata").parse_notes()
-        plan = watch.plan_files(os_name, entries, notes, "7.9", "8.0")
+        membership = __import__("gendata").parse_membership()
+        plan = watch.plan_files(os_name, entries, notes, "7.9", "8.0",
+                                membership)
         names = sorted(os.path.basename(p["path"]) for p in plan)
         self.assertEqual(names, ["demo-8.0.conf"])
 
@@ -817,6 +819,45 @@ class TestMain(WatchCase):
         self.addCleanup(setattr, watch, "_TEST_OPENER", None)
         self.assertEqual(watch.main([]), 0)
         self.assertTrue(os.path.exists("conf/demo-15.2.conf"))
+
+    def test_landed_tags_are_switched_on_in_membership(self):
+        # without the append, the watcher's confs exist but never enter
+        # the build matrix -- all.release.conf is the hand-owned switch
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1.img"))
+        self.add("demo-15.1-aarch64.conf", conf_text(
+            "demo", "15.1", arch="aarch64", url="https://x/15.1-arm.img"))
+        write("conf/all.release.conf",
+              "ALL_RELEASES='\"15.1\", \"15.1-aarch64\"'\n")
+        self.hook('print("15.2")')
+        watch._TEST_OPENER = FakeOpener({"https://x/15.2.img": 200,
+                                         "https://x/15.2-arm.img": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main([]), 0)
+        text = open("conf/all.release.conf", encoding="utf-8").read()
+        self.assertEqual(
+            text,
+            "ALL_RELEASES='\"15.1\", \"15.1-aarch64\", "
+            "\"15.2\", \"15.2-aarch64\"'\n")
+
+    def test_check_mode_does_not_touch_membership(self):
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1.img"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"15.1\"'\n")
+        self.hook('print("15.2")')
+        watch._TEST_OPENER = FakeOpener({"https://x/15.2.img": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--check"]), 0)
+        self.assertEqual(open("conf/all.release.conf").read(),
+                         "ALL_RELEASES='\"15.1\"'\n")
+
+    def test_membership_append_preserves_crlf(self):
+        with open("conf/all.release.conf", "wb") as f:
+            f.write(b"ALL_RELEASES='\"15.1\"'\r\n")
+        added = watch.append_membership(["15.2"])
+        self.assertEqual(added, ["15.2"])
+        data = open("conf/all.release.conf", "rb").read()
+        self.assertEqual(data, b"ALL_RELEASES='\"15.1\", \"15.2\"'\r\n")
 
     def test_bad_url_aborts_and_writes_nothing(self):
         self.add("demo-15.1.conf", conf_text(
