@@ -290,6 +290,29 @@ class TestRenderTable(GendataCase):
         out = gendata.render_table(entries, gendata.parse_notes())
         self.assertNotIn("15.0-xfce", out)
 
+    def test_desp_appended(self):
+        self.add("demo-15.0.conf", conf_text("demo", "15.0"))
+        write(gendata.DESP_PATH, "## How these images are built\n\nProse.\n")
+        entries = gendata.scan_confs()[1]
+        out = gendata.render_table(entries, gendata.parse_notes())
+        self.assertTrue(out.endswith(
+            "\n\n## How these images are built\n\nProse.\n"))
+
+    def test_desp_appended_after_notes(self):
+        self.add("demo-13.4.conf", conf_text("demo", "13.4"))
+        write(gendata.NOTES_PATH, "[^n]: a footnote\n")
+        write(gendata.DESP_PATH, "Build prose.\n")
+        entries = gendata.scan_confs()[1]
+        out = gendata.render_table(entries, gendata.parse_notes())
+        self.assertTrue(out.endswith("[^n]: a footnote\n\nBuild prose.\n"))
+
+    def test_empty_desp_ignored(self):
+        self.add("demo-15.0.conf", conf_text("demo", "15.0"))
+        write(gendata.DESP_PATH, "\n")
+        entries = gendata.scan_confs()[1]
+        out = gendata.render_table(entries, gendata.parse_notes())
+        self.assertTrue(out.endswith("| 15.0 | \u2705 (rsync,scp) |\n\n"))
+
     def test_force_desktop_override(self):
         self.add("demo-16.conf", conf_text("demo", "16"))
         write(gendata.NOTES_PATH, "<!-- desktop-table: 16 -->\n")

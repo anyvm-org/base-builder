@@ -8,9 +8,10 @@
 #   conf/all.release.conf        ALL_RELEASES -- WHICH confs build (the
 #                                switch; a conf absent from this list is
 #                                documented but not built)
-# Hand-owned presentation input: .github/data/table.notes.md (footnotes,
+# Hand-owned presentation inputs: .github/data/table.notes.md (footnotes,
 # cosmetic labels, extra columns, shelved rows, url templates -- nothing
-# in it changes what builds).
+# in it changes what builds) and .github/data/desp.md (optional prose on
+# how the images are built, appended verbatim at the end of table.md).
 #
 # Generated files (all overwritten in place):
 #   .github/data/table.md        main release table (README render input)
@@ -33,6 +34,7 @@ CONF_DIR = "conf"
 DATA_DIR = os.path.join(".github", "data")
 NOTES_PATH = os.path.join(DATA_DIR, "table.notes.md")
 DESKTOP_NOTES_PATH = os.path.join(DATA_DIR, "desktop.notes.md")
+DESP_PATH = os.path.join(DATA_DIR, "desp.md")
 SKIP_PATH = os.path.join(DATA_DIR, "gendata.skip")
 
 CANON_ARCHES = [
@@ -369,6 +371,24 @@ def render_table(entries, notes):
         text += notes["raw"]
         if not text.endswith("\n"):
             text += "\n"
+    text = append_desp(text)
+    return text
+
+
+def append_desp(text):
+    # .github/data/desp.md -- optional hand-owned prose describing how
+    # the images are built (upstream source, official links). Appended
+    # verbatim at the very end of the generated table.md, separated by
+    # one blank line.
+    if not os.path.exists(DESP_PATH):
+        return text
+    with open(DESP_PATH, "r", encoding="utf-8") as f:
+        raw = f.read()
+    if not raw.strip():
+        return text
+    text = text.rstrip("\n") + "\n\n" + raw
+    if not text.endswith("\n"):
+        text += "\n"
     return text
 
 
