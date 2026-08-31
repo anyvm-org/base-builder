@@ -1628,7 +1628,22 @@ def build_guest_profile():
     # too (the BUILD still runs on pc -- see _profile_machine()).
     mmio = (osname == "netbsd" and arch == "riscv64") or bool(env("VM_MICROVM"))
     nic = net_card()
-    if mmio and nic.startswith("virtio-net-pci"):
+    if env("VM_MICROVM"):
+        # The microvm machine has NO PCI bus, so the runtime NIC is always the
+        # MMIO virtio device -- INDEPENDENT of whatever the build ran on. The
+        # build uses the pc machine and whatever net_card() picks there (e1000
+        # for netbsd/x86_64), and that is deliberately left alone: deriving the
+        # profile's NIC from the build's would force a microvm conf to set
+        # VM_NIC=virtio purely to steer this field, which makes the variant's
+        # BUILD differ from the plain release's for no runtime reason. It does
+        # not need to match: these guests configure the network by interface
+        # discovery (netbsd runs a global dhcpcd), so an image installed with
+        # wm0 brings up vioif0 at run time -- verified by booting the plain
+        # e1000-built 11.0 image under microvm and watching vioif0 take a
+        # lease. Keeps netbsd's ctrl_vq=off decoration (the vioif control-queue
+        # wedge applies to the MMIO transport too).
+        nic = netbsd_ctrl_vq_off("virtio-net-device")
+    elif mmio and nic.startswith("virtio-net-pci"):
         # startswith, NOT ==: net_card() returns the model WITH option
         # flags ("virtio-net-pci,ctrl_vq=off" on netbsd), so an exact
         # match silently skipped the translation and the profile shipped
