@@ -47,21 +47,44 @@ class WatchCase(unittest.TestCase):
 
 class TestDetect(WatchCase):
     def test_prints_version(self):
+        # the original one-line contract: still valid, unchanged
         self.hook('print("15.2")')
-        self.assertEqual(watch.detect_upstream(), ("15.2", 0))
+        self.assertEqual(watch.detect_upstream(), (["15.2"], 0))
+
+    def test_several_lines_are_all_reported(self):
+        # the widened contract -- one version per line, so a maintenance
+        # branch published after a newer major is visible at all
+        self.hook('print("13.5")\nprint("14.5")\nprint("15.1")')
+        self.assertEqual(watch.detect_upstream(),
+                         (["13.5", "14.5", "15.1"], 0))
+
+    def test_blank_lines_and_padding_are_ignored(self):
+        self.hook('print("\\n  14.5  \\n\\n15.1\\n")')
+        self.assertEqual(watch.detect_upstream(), (["14.5", "15.1"], 0))
+
+    def test_duplicate_lines_collapse(self):
+        self.hook('print("14.5")\nprint("14.5")')
+        self.assertEqual(watch.detect_upstream(), (["14.5"], 0))
 
     def test_empty_output_is_noop_not_error(self):
         self.hook('pass')
-        self.assertEqual(watch.detect_upstream(), ("", 0))
+        self.assertEqual(watch.detect_upstream(), ([], 0))
 
     def test_nonzero_exit_is_reported(self):
         self.hook('import sys; sys.stderr.write("boom\\n"); sys.exit(3)')
-        version, rc = watch.detect_upstream()
-        self.assertEqual(version, "")
+        versions, rc = watch.detect_upstream()
+        self.assertEqual(versions, [])
+        self.assertNotEqual(rc, 0)
+
+    def test_output_before_a_nonzero_exit_is_discarded(self):
+        # a hook that prints a guess and THEN fails must not land it
+        self.hook('print("15.2")\nimport sys; sys.exit(2)')
+        versions, rc = watch.detect_upstream()
+        self.assertEqual(versions, [])
         self.assertNotEqual(rc, 0)
 
     def test_missing_hook(self):
-        self.assertEqual(watch.detect_upstream(), ("", watch.NO_HOOK))
+        self.assertEqual(watch.detect_upstream(), ([], watch.NO_HOOK))
 
     def test_vm_vars_are_stripped_but_the_environment_survives(self):
         self.hook('import os\n'
@@ -73,7 +96,7 @@ class TestDetect(WatchCase):
         self.addCleanup(os.environ.pop, "WATCH_PROBE", None)
         # VM_* must not steer detection; everything else must reach the
         # hook -- an HTTPS fetch needs platform variables to work at all.
-        self.assertEqual(watch.detect_upstream(), ("-|kept", 0))
+        self.assertEqual(watch.detect_upstream(), (["-|kept"], 0))
 
 
 class TestDecide(WatchCase):
@@ -178,6 +201,208 @@ class TestDecide(WatchCase):
         self.assertEqual(
             watch.decide(os_name, entries, notes, "24.03-LTS-SP2"),
             ("new", "24.03-LTS-SP1"))
+
+
+class TestBranchTemplate(WatchCase):
+    """The branch rule: which conf a reported version is modelled on.
+
+    The regression this exists for: FreeBSD 14.5-RELEASE was published
+    on 2026-09-04, AFTER 15.1. The watcher only ever compared against
+    the numerically newest conf, so it reported "already covered" every
+    night; 14.5 was added by hand. Templating it from 15.1 would have
+    been just as wrong -- 15.x images are named "-zfs.qcow2.xz" and
+    14.x are not, so the derived URL would not exist.
+    """
+
+    def _load(self, membership=None):
+        gd = __import__("gendata")
+        if membership is not None:
+            write("conf/all.release.conf",
+                  "ALL_RELEASES='%s'\n"
+                  % ", ".join('"%s"' % t for t in membership))
+        os_name, entries = gd.scan_confs()
+        return os_name, entries, gd.parse_notes(), gd.parse_membership()
+
+    def _freebsd(self):
+        for rel in ("13.5", "14.3", "14.4", "15.0", "15.1"):
+            self.add("demo-%s.conf" % rel, conf_text("demo", rel))
+
+    def test_maintenance_release_uses_its_own_branch(self):
+        self._freebsd()
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "14.5", member),
+            ("new", "14.4"))
+
+    def test_newest_branch_release_still_uses_the_newest_conf(self):
+        self._freebsd()
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "15.2", member),
+            ("new", "15.1"))
+
+    def test_a_brand_new_branch_falls_back_to_the_newest_overall(self):
+        # openbsd 7.9 -> 8.0, ghostbsd 26.x -> 27.x: there is no conf on
+        # the new branch, and the newest release is the best model there
+        # is. This is the pre-2026-09-09 behaviour, deliberately kept.
+        self._freebsd()
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "16.0", member),
+            ("new", "15.1"))
+
+    def test_older_release_on_a_branch_with_no_conf_is_refused(self):
+        # NetBSD's ftp index still lists 8.3 and openEuler's still lists
+        # 20.09; a branch the maintainer does not track must never be
+        # resurrected just because upstream still publishes it.
+        self._freebsd()
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "12.4", member)[0],
+            "none")
+
+    def test_older_release_not_newer_than_its_branch_is_refused(self):
+        self._freebsd()
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "14.3", member)[0],
+            "none")
+
+    def test_a_branch_switched_off_in_membership_is_not_revived(self):
+        # every 13.x conf exists on disk but none is in ALL_RELEASES:
+        # the maintainer turned that branch off, so 13.6 is not wanted
+        # even though it is newer than 13.5.
+        self._freebsd()
+        os_name, entries, notes, member = self._load(
+            ["14.3", "14.4", "15.0", "15.1"])
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "13.6", member)[0],
+            "none")
+
+    def test_a_shelved_branch_is_not_used_as_a_template(self):
+        self._freebsd()
+        write(__import__("gendata").NOTES_PATH,
+              "<!-- shelved: 15.0 -->\n<!-- shelved: 15.1 -->\n")
+        os_name, entries, notes, member = self._load()
+        # 15.x is hidden entirely, so 16.0 models on the newest live one
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "16.0", member),
+            ("new", "14.4"))
+
+    def test_service_pack_chains_stay_on_their_own_branch(self):
+        # openEuler: a new SP of 22.03-LTS must come from 22.03-LTS-SP4,
+        # not from the numerically newer 25.09 interim release.
+        for rel in ("22.03-LTS-SP4", "24.03-LTS-SP4", "25.09"):
+            self.add("demo-%s.conf" % rel, conf_text("demo", rel))
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "22.03-LTS-SP5", member),
+            ("new", "22.03-LTS-SP4"))
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "24.03-LTS-SP5", member),
+            ("new", "24.03-LTS-SP4"))
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "25.10", member),
+            ("new", "25.09"))
+
+    def test_point_release_branches(self):
+        # midnightbsd: 2.2.x / 3.2.x / 4.0.x all live at once
+        for rel in ("2.2.8", "3.2.4", "4.0.7"):
+            self.add("demo-%s.conf" % rel, conf_text("demo", rel))
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "3.2.5", member),
+            ("new", "3.2.4"))
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "4.0.8", member),
+            ("new", "4.0.7"))
+
+    def test_single_branch_builders_are_unaffected(self):
+        # omnios/openindiana/plan9 shape: one monotonic line, so the
+        # branch of every release is the same and the newest wins, which
+        # is exactly what the pre-branch code did.
+        for rel in ("r151054", "r151056", "r151058"):
+            self.add("demo-%s.conf" % rel, conf_text("demo", rel))
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "r151060", member),
+            ("new", "r151058"))
+
+    def test_variant_template_resolves_to_its_real_release(self):
+        # the -build variant ranks above its base under natural_key; the
+        # template must still be the real release on that branch.
+        self.add("demo-202510.conf", conf_text("demo", "202510"))
+        self.add("demo-202510-build.conf", conf_text("demo", "202510-build"))
+        os_name, entries, notes, member = self._load()
+        self.assertEqual(
+            watch.decide(os_name, entries, notes, "202604", member),
+            ("new", "202510"))
+
+
+class TestBranchKey(unittest.TestCase):
+    """gendata.branch_key / newest_per_branch -- the rule both the
+    detection hooks and watch.decide() share."""
+
+    def setUp(self):
+        self.gd = __import__("gendata")
+
+    def test_last_numeric_component_is_dropped(self):
+        bk = self.gd.branch_key
+        self.assertEqual(bk("14.4"), bk("14.5"))
+        self.assertNotEqual(bk("14.5"), bk("15.1"))
+        self.assertNotEqual(bk("9.4"), bk("10.1"))
+
+    def test_point_releases_branch_on_major_minor(self):
+        bk = self.gd.branch_key
+        self.assertEqual(bk("4.0.6"), bk("4.0.7"))
+        self.assertNotEqual(bk("3.2.4"), bk("4.0.7"))
+
+    def test_service_packs_branch_apart(self):
+        bk = self.gd.branch_key
+        self.assertEqual(bk("22.03-LTS-SP4"), bk("22.03-LTS-SP5"))
+        self.assertNotEqual(bk("22.03-LTS-SP4"), bk("24.03-LTS-SP4"))
+        self.assertNotEqual(bk("22.03-LTS-SP4"), bk("25.09"))
+
+    def test_mixed_alpha_digit_versions(self):
+        bk = self.gd.branch_key
+        self.assertEqual(bk("r1beta5"), bk("r1beta6"))
+        self.assertNotEqual(bk("r1beta5"), bk("r2beta1"))
+        self.assertEqual(bk("0m40"), bk("0m41"))
+
+    def test_single_token_versions_share_one_branch(self):
+        bk = self.gd.branch_key
+        self.assertEqual(bk("11554"), bk("11952"))
+        self.assertEqual(bk("202510"), bk("202604"))
+        self.assertEqual(bk("r151046"), bk("r151060"))
+
+    def test_a_version_with_no_digits_is_its_own_branch(self):
+        # nextbsd's mutable "continuous" tag -- no field can move
+        bk = self.gd.branch_key
+        self.assertEqual(bk("continuous"), bk("continuous"))
+        self.assertNotEqual(bk("continuous"), bk("15.1"))
+
+    def test_newest_per_branch_picks_one_per_line(self):
+        self.assertEqual(
+            self.gd.newest_per_branch(
+                ["13.4", "13.5", "14.3", "14.5", "14.4", "15.0", "15.1"]),
+            ["13.5", "14.5", "15.1"])
+
+    def test_newest_per_branch_is_deterministic_and_deduped(self):
+        out = self.gd.newest_per_branch(["15.1", "14.5", "15.1", "14.5"])
+        self.assertEqual(out, ["14.5", "15.1"])
+
+    def test_newest_per_branch_uses_natural_key_not_string_order(self):
+        # the mixed alpha+digit ordering rule: r1beta10 is NEWER than
+        # r1beta5, though it sorts below it as a plain string
+        self.assertEqual(
+            self.gd.newest_per_branch(["r1beta5", "r1beta10"]),
+            ["r1beta10"])
+        self.assertEqual(self.gd.newest_per_branch(["14.9", "14.10"]),
+                         ["14.10"])
+
+    def test_newest_per_branch_of_one_is_that_one(self):
+        self.assertEqual(self.gd.newest_per_branch(["15.1"]), ["15.1"])
+        self.assertEqual(self.gd.newest_per_branch([]), [])
 
 
 class TestRealBases(WatchCase):
@@ -747,6 +972,32 @@ class TestCompanionGuard(unittest.TestCase):
               "leftovers": []}]), [])
 
 
+class TestPlanCollisionGuard(unittest.TestCase):
+    """Only several reported versions in one run can trip this."""
+
+    def _job(self, version, paths):
+        return {"version": version,
+                "items": [{"path": p} for p in paths]}
+
+    def test_distinct_paths_pass(self):
+        jobs = [self._job("14.5", ["conf/demo-14.5.conf"]),
+                self._job("15.2", ["conf/demo-15.2.conf"])]
+        self.assertEqual(watch.check_plan_collisions(jobs), [])
+
+    def test_same_path_from_two_versions_is_caught(self):
+        jobs = [self._job("14.5", ["conf/demo-x.conf"]),
+                self._job("15.2", ["conf/demo-x.conf"])]
+        bad = watch.check_plan_collisions(jobs)
+        self.assertEqual(len(bad), 1)
+        self.assertIn("conf/demo-x.conf", bad[0])
+        self.assertIn("14.5", bad[0])
+        self.assertIn("15.2", bad[0])
+
+    def test_a_single_job_never_collides_with_itself(self):
+        jobs = [self._job("14.5", ["conf/a.conf", "conf/b.conf"])]
+        self.assertEqual(watch.check_plan_collisions(jobs), [])
+
+
 class TestVerify(unittest.TestCase):
     def test_all_ok(self):
         plan = [{"path": "conf/a.conf", "urls": ["https://x/a"]}]
@@ -819,6 +1070,143 @@ class TestMain(WatchCase):
         self.addCleanup(setattr, watch, "_TEST_OPENER", None)
         self.assertEqual(watch.main([]), 0)
         self.assertTrue(os.path.exists("conf/demo-15.2.conf"))
+
+    def test_two_branches_land_in_one_run(self):
+        # the FreeBSD regression, end to end: 14.5 was published after
+        # 15.1, so the run has to land BOTH and take each one's template
+        # from its own branch. 15.x images carry "-zfs" in the name and
+        # 14.x do not, which is what makes a cross-branch template a
+        # broken URL rather than merely an untidy conf.
+        self.add("demo-14.4.conf", conf_text(
+            "demo", "14.4", url="https://x/14.4/img-14.4.qcow2.xz"))
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1/img-15.1-zfs.qcow2.xz"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"14.4\", \"15.1\"'\n")
+        self.hook('print("14.5")\nprint("15.2")')
+        watch._TEST_OPENER = FakeOpener({
+            "https://x/14.5/img-14.5.qcow2.xz": 200,
+            "https://x/15.2/img-15.2-zfs.qcow2.xz": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--landed-out", "landed.txt"]), 0)
+        got14 = open("conf/demo-14.5.conf", encoding="utf-8").read()
+        got15 = open("conf/demo-15.2.conf", encoding="utf-8").read()
+        self.assertIn("https://x/14.5/img-14.5.qcow2.xz", got14)
+        self.assertNotIn("zfs", got14)          # NOT modelled on 15.1
+        self.assertIn("https://x/15.2/img-15.2-zfs.qcow2.xz", got15)
+        self.assertEqual(
+            open("conf/all.release.conf", encoding="utf-8").read(),
+            "ALL_RELEASES='\"14.4\", \"15.1\", \"14.5\", \"15.2\"'\n")
+        # one notification issue per landed version
+        self.assertEqual(open("landed.txt", encoding="utf-8").read(),
+                         "new 14.5\nnew 15.2\n")
+
+    def test_one_dead_url_aborts_every_version(self):
+        # the HEAD gate is unchanged: any non-2xx aborts the WHOLE run
+        # with zero files written, including the legs that were fine.
+        self.add("demo-14.4.conf", conf_text(
+            "demo", "14.4", url="https://x/14.4/img-14.4.qcow2.xz"))
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1/img-15.1-zfs.qcow2.xz"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"14.4\", \"15.1\"'\n")
+        self.hook('print("14.5")\nprint("15.2")')
+        watch._TEST_OPENER = FakeOpener({
+            "https://x/14.5/img-14.5.qcow2.xz": 200})   # 15.2 leg 404s
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--landed-out", "landed.txt"]), 1)
+        self.assertFalse(os.path.exists("conf/demo-14.5.conf"))
+        self.assertFalse(os.path.exists("conf/demo-15.2.conf"))
+        self.assertFalse(os.path.exists("landed.txt"))
+        self.assertEqual(
+            open("conf/all.release.conf", encoding="utf-8").read(),
+            "ALL_RELEASES='\"14.4\", \"15.1\"'\n")
+
+    def test_covered_versions_alongside_a_new_one_are_ignored(self):
+        # the everyday run: the hook reports every branch's newest, and
+        # all but one of them already have confs.
+        self.add("demo-13.5.conf", conf_text(
+            "demo", "13.5", url="https://x/13.5/img-13.5.qcow2.xz"))
+        self.add("demo-14.4.conf", conf_text(
+            "demo", "14.4", url="https://x/14.4/img-14.4.qcow2.xz"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"13.5\", \"14.4\"'\n")
+        self.hook('print("13.5")\nprint("14.5")')
+        watch._TEST_OPENER = FakeOpener({
+            "https://x/14.5/img-14.5.qcow2.xz": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--landed-out", "landed.txt"]), 0)
+        self.assertTrue(os.path.exists("conf/demo-14.5.conf"))
+        self.assertEqual(open("landed.txt", encoding="utf-8").read(),
+                         "new 14.5\n")
+
+    def test_refresh_and_new_in_the_same_run(self):
+        # netbsd's shape: 11.0's confs still pin RC media (refresh) while
+        # 10.2 has just appeared on the maintenance branch (new).
+        self.add("demo-10.1.conf", conf_text(
+            "demo", "10.1", url="https://x/N-10.1/N-10.1-amd64.iso"))
+        self.add("demo-11.0.conf", conf_text(
+            "demo", "11.0",
+            url="https://x/N-11.0_RC7/N-11.0_RC7-amd64.iso"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"10.1\", \"11.0\"'\n")
+        self.hook('print("10.2")\nprint("11.0")')
+        watch._TEST_OPENER = FakeOpener({
+            "https://x/N-10.2/N-10.2-amd64.iso": 200,
+            "https://x/N-11.0/N-11.0-amd64.iso": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--landed-out", "landed.txt"]), 0)
+        self.assertIn("https://x/N-10.2/N-10.2-amd64.iso",
+                      open("conf/demo-10.2.conf", encoding="utf-8").read())
+        self.assertIn("https://x/N-11.0/N-11.0-amd64.iso",
+                      open("conf/demo-11.0.conf", encoding="utf-8").read())
+        self.assertEqual(open("landed.txt", encoding="utf-8").read(),
+                         "new 10.2\nrefresh 11.0\n")
+        # only the landed release joins the matrix; the refreshed one is
+        # already in it
+        self.assertEqual(
+            open("conf/all.release.conf", encoding="utf-8").read(),
+            "ALL_RELEASES='\"10.1\", \"11.0\", \"10.2\"'\n")
+
+    def test_check_mode_with_two_versions_writes_nothing(self):
+        self.add("demo-14.4.conf", conf_text(
+            "demo", "14.4", url="https://x/14.4/img-14.4.qcow2.xz"))
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1/img-15.1.qcow2.xz"))
+        write("conf/all.release.conf", "ALL_RELEASES='\"14.4\", \"15.1\"'\n")
+        self.hook('print("14.5")\nprint("15.2")')
+        watch._TEST_OPENER = FakeOpener({
+            "https://x/14.5/img-14.5.qcow2.xz": 200,
+            "https://x/15.2/img-15.2.qcow2.xz": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main(["--check"]), 0)
+        self.assertFalse(os.path.exists("conf/demo-14.5.conf"))
+        self.assertFalse(os.path.exists("conf/demo-15.2.conf"))
+        self.assertEqual(
+            open("conf/all.release.conf", encoding="utf-8").read(),
+            "ALL_RELEASES='\"14.4\", \"15.1\"'\n")
+
+    def test_every_variant_of_the_branch_template_is_replicated(self):
+        # 14.5 must bring its arch confs with it -- and must NOT pick up
+        # 15.1's desktop variants, which belong to the other branch.
+        self.add("demo-14.4.conf", conf_text(
+            "demo", "14.4", url="https://x/14.4/img-14.4.qcow2.xz"))
+        self.add("demo-14.4-riscv64.conf", conf_text(
+            "demo", "14.4", arch="riscv64",
+            url="https://x/14.4/img-14.4-riscv.qcow2.xz"))
+        self.add("demo-15.1.conf", conf_text(
+            "demo", "15.1", url="https://x/15.1/img-15.1.qcow2.xz"))
+        self.add("demo-15.1-xfce.conf", conf_text(
+            "demo", "15.1-xfce", url="https://x/15.1/img-15.1.qcow2.xz",
+            extra='VM_EXTRA_SCRIPT="hooks/xfce.sh"'))
+        write("conf/all.release.conf",
+              "ALL_RELEASES='\"14.4\", \"14.4-riscv64\", \"15.1\", "
+              "\"15.1-xfce\"'\n")
+        self.hook('print("14.5")')
+        watch._TEST_OPENER = FakeOpener({
+            "https://x/14.5/img-14.5.qcow2.xz": 200,
+            "https://x/14.5/img-14.5-riscv.qcow2.xz": 200})
+        self.addCleanup(setattr, watch, "_TEST_OPENER", None)
+        self.assertEqual(watch.main([]), 0)
+        self.assertTrue(os.path.exists("conf/demo-14.5.conf"))
+        self.assertTrue(os.path.exists("conf/demo-14.5-riscv64.conf"))
+        self.assertFalse(os.path.exists("conf/demo-14.5-xfce.conf"))
 
     def test_landed_tags_are_switched_on_in_membership(self):
         # without the append, the watcher's confs exist but never enter

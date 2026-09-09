@@ -9,9 +9,21 @@
 # --check prints what it would write and never touches the disk.
 #
 # The per-builder detection hook (hooks/upstream_check.py) only has to
-# print the latest upstream version, in the same form the confs use for
-# VM_RELEASE. Empty output means "nothing detected"; a non-zero exit means
-# detection is broken and must be reported, never swallowed.
+# print upstream's current versions, one per line, in the same form the
+# confs use for VM_RELEASE. Empty output means "nothing detected"; a
+# non-zero exit means detection is broken and must be reported, never
+# swallowed.
+#
+# ONE LINE PER VERSION, not one line total (widened 2026-09-09). A hook
+# that prints a single line is the one-element case and keeps working
+# unchanged -- that is the whole fleet's original shape. Upstreams that
+# maintain several branches at once (FreeBSD 14.x beside 15.x, NetBSD
+# 9.x/10.x/11.x, openEuler's LTS service packs beside the interim line)
+# report the newest version of EACH branch, because a maintenance
+# release published after a newer major is otherwise invisible: FreeBSD
+# 14.5-RELEASE appeared on 2026-09-04 and every nightly run said
+# "15.1 already has a conf, nothing to do" until it was added by hand.
+# Each reported version is decided, templated and gated independently.
 
 import argparse
 import os
@@ -53,14 +65,22 @@ def fatal(msg):
 
 
 def detect_upstream():
-    """Run the detection hook. Returns (version, rc).
+    """Run the detection hook. Returns (versions, rc).
 
-    version is "" when the hook is missing, prints nothing, or fails.
-    rc is NO_HOOK when there is no hook at all, otherwise the hook's exit
-    code -- the caller distinguishes "nothing to do" from "broken".
+    versions is the hook's stdout, ONE VERSION PER LINE: blank lines are
+    dropped, duplicates collapse, and hook order is preserved (main()
+    sorts by natural_key, so the order here is only what the log shows).
+    A hook that prints a single line yields a one-element list and needs
+    no change -- that was the whole fleet before 2026-09-09.
+
+    The list is empty when the hook is missing, prints nothing, or
+    fails: empty stdout with exit 0 still means "nothing detected", not
+    an error. rc is NO_HOOK when there is no hook at all, otherwise the
+    hook's exit code -- the caller distinguishes "nothing to do" from
+    "broken".
     """
     if not os.path.exists(HOOK_PATH):
-        return ("", NO_HOOK)
+        return ([], NO_HOOK)
     # Strip VM_* so a stray exported build variable cannot steer detection,
     # but keep the rest of the environment. A bare {"PATH": ...} (what
     # gendata.source_conf uses, correctly, for a conf it SOURCES) breaks a
@@ -78,10 +98,13 @@ def detect_upstream():
     if p.returncode != 0:
         warn("%s exited %d: %s" % (HOOK_PATH, p.returncode,
                                    p.stderr.strip()[:400]))
-        return ("", p.returncode)
-    version = p.stdout.strip().splitlines()
-    version = version[0].strip() if version else ""
-    return (version, 0)
+        return ([], p.returncode)
+    versions = []
+    for line in p.stdout.splitlines():
+        v = line.strip()
+        if v and v not in versions:
+            versions.append(v)
+    return (versions, 0)
 
 
 def real_bases(entries):
@@ -121,6 +144,75 @@ def watch_base(entry, bases):
     return max(cands, key=len) if cands else rel
 
 
+def live_bases(entries, notes, membership=None):
+    """The real releases a template may be taken from.
+
+    A release qualifies when it is a real base (not a desktop or
+    "-build" style variant), is not `shelved:` in table.notes.md, and is
+    switched ON in conf/all.release.conf. The membership filter is the
+    same rule plan_files() replicates under: a template whose confs are
+    all switched off would produce an empty plan, and a shelved one must
+    never be resurrected under a new tag.
+
+    `membership` of None means "no all.release.conf here" (bare test
+    fixtures; every real repo has one) -- every conf then counts, which
+    is what gendata.parse_membership() already tells its callers.
+    """
+    reals = real_bases(entries)
+    member = (set(membership) if membership is not None
+              else set(e["tag"] for e in entries))
+    live = set()
+    for e in entries:
+        if e["desktop"]:
+            continue
+        if e["tag"] in notes["shelved"] or e["tag"] not in member:
+            continue
+        live.add(watch_base(e, reals))
+    return live
+
+
+def pick_template(version, live):
+    """The release a new `version` should be modelled on, or "".
+
+    THE BRANCH RULE. A reported version is templated from the newest
+    live release ON ITS OWN BRANCH (gendata.branch_key), never from
+    whatever is numerically newest overall. FreeBSD 14.5 must come from
+    14.4, not from 15.1: the two branches disagree about the image name
+    ("-zfs.qcow2.xz" only from 15.x) and about VM_INSTALL_CMD, so a
+    cross-branch template lands confs whose URLs do not exist.
+
+    A version whose branch has no live release at all is only accepted
+    when it is newer than EVERYTHING this builder builds -- that is a
+    genuinely new branch (openbsd 7.9 -> 8.0, ghostbsd 26.x -> 27.x),
+    and the newest live release is the best available model. Older than
+    that means an upstream branch this repo does not track (NetBSD's
+    ftp index still lists 8.3; openEuler's still lists 20.09), and
+    resurrecting one is exactly what the maintainer said no to by
+    leaving it out of conf/all.release.conf.
+
+    Returns "" when the version is not newer than its own branch's
+    newest, or when it is off-branch and not newer than everything.
+    """
+    if not live:
+        return ""
+    vkey = gendata.natural_key(version)
+    branch = gendata.branch_key(version)
+    same = [b for b in live if gendata.branch_key(b) == branch]
+    if same:
+        newest = max(same, key=gendata.natural_key)
+        if vkey <= gendata.natural_key(newest):
+            log("%s is not newer than %s on its own branch, nothing to do"
+                % (version, newest))
+            return ""
+        return newest
+    newest = max(live, key=gendata.natural_key)
+    if vkey <= gendata.natural_key(newest):
+        log("%s has no branch in conf/all.release.conf and is not newer "
+            "than %s, nothing to do" % (version, newest))
+        return ""
+    return newest
+
+
 def _rc_token_re(version):
     """The version pinned to release-candidate media: '11.0_RC7' or
     '11.0-RC7' style, exactly for this version."""
@@ -139,9 +231,15 @@ def _conf_urls(os_name, tag):
     return urls
 
 
-def decide(os_name, entries, notes, version):
-    """Return (action, arg). action is "none", "new" (arg = template
-    release) or "refresh" (arg = version whose confs pin RC media)."""
+def decide(os_name, entries, notes, version, membership=None):
+    """Return (action, arg) for ONE reported version. action is "none",
+    "new" (arg = template release) or "refresh" (arg = version whose
+    confs pin RC media).
+
+    Called once per line the hook printed, so every reported version is
+    judged and templated on its own -- a run can land 14.5 from 14.4 and
+    15.2 from 15.1 in the same commit.
+    """
     if not version:
         return ("none", None)
     # Exact match only: notes["shelved"] holds conf TAGS, which may carry
@@ -176,18 +274,17 @@ def decide(os_name, entries, notes, version):
                 return ("refresh", version)
             log("%s already has a conf, nothing to do" % version)
             return ("none", None)
-    # Shelved entries are excluded from the template candidates too -- a
-    # shelved conf being the numerically newest must not make plan_files
-    # replicate it (it would just skip it and hand back an odd/empty plan).
-    bases = [watch_base(e, reals) for e in entries
-             if not e["desktop"] and e["tag"] not in notes["shelved"]]
-    if not bases:
-        fatal("no non-desktop conf to use as a template")
-    newest = sorted(set(bases), key=gendata.natural_key)[-1]
-    if gendata.natural_key(version) <= gendata.natural_key(newest):
-        log("%s is not newer than %s, nothing to do" % (version, newest))
+    # Shelved and switched-off entries are excluded from the template
+    # candidates -- a shelved conf being the numerically newest must not
+    # make plan_files replicate it (it would just skip it and hand back an
+    # odd/empty plan), and neither must one the maintainer switched off.
+    live = live_bases(entries, notes, membership)
+    if not live:
+        fatal("no live non-desktop conf to use as a template")
+    template = pick_template(version, live)
+    if not template:
         return ("none", None)
-    return ("new", newest)
+    return ("new", template)
 
 
 def compress(version):
@@ -677,6 +774,27 @@ def check_urls_moved(plan):
     return bad
 
 
+def check_plan_collisions(jobs):
+    """Refuse a run where two reported versions plan the same file.
+
+    With one version per run this could not happen; with several it is
+    the one way they can interfere. The second write would silently
+    overwrite the first, and which one won would depend on plan order
+    rather than on anything the maintainer said -- so the run fails
+    before the first open(), like every other gate here.
+    """
+    owner, bad = {}, []
+    for job in jobs:
+        for item in job["items"]:
+            path = item["path"]
+            if path in owner:
+                bad.append("%s: planned by both %s and %s"
+                           % (path, owner[path], job["version"]))
+            else:
+                owner[path] = job["version"]
+    return bad
+
+
 class UrlError(Exception):
     pass
 
@@ -797,40 +915,72 @@ def main(argv=None):
     if not os.path.isdir(gendata.CONF_DIR):
         fatal("no conf/ directory here; run from a builder repo root")
 
-    version, rc = detect_upstream()
+    versions, rc = detect_upstream()
     if rc == NO_HOOK:
         log("no %s, nothing to watch" % HOOK_PATH)
         return 0
     if rc != 0:
         sys.stderr.write("watch: detection hook failed (rc=%d)\n" % rc)
         return 1
-    if not version:
+    if not versions:
         log("hook reported no version, nothing to do")
         return 0
-    log("upstream reports %s" % version)
+    log("upstream reports %s" % ", ".join(versions))
 
     os_name, entries = gendata.scan_confs()
     notes = gendata.parse_notes()
     gendata.apply_overrides(entries, notes)
-    action, template = decide(os_name, entries, notes, version)
-    if action == "none":
+    membership = gendata.parse_membership()
+
+    # Every reported version is decided on its own, oldest first, so a
+    # run landing several branches writes them in a stable order and the
+    # membership line grows in natural-key order.
+    #
+    # Two "new" versions on the SAME branch (upstream published 14.5 and
+    # 14.6 while this repo had neither) both take the branch's newest
+    # ON-DISK release as their template. Chaining 14.6 onto the 14.5 this
+    # run is about to write would mean re-scanning conf/ mid-plan; the
+    # confs are structurally identical within a branch, so the derived
+    # URLs are right either way and the extra machinery buys nothing.
+    jobs = []
+    for version in sorted(versions, key=gendata.natural_key):
+        action, template = decide(os_name, entries, notes, version,
+                                  membership)
+        if action != "none":
+            jobs.append({"action": action, "version": version,
+                         "template": template, "items": []})
+    if not jobs:
         return 0
 
-    if action == "refresh":
-        plan = plan_refresh(os_name, entries, version)
-        if not plan:
-            log("nothing to refresh after all")
-            return 0
-        log("refreshing %d conf(s) from RC to final %s media"
-            % (len(plan), version))
-    else:
-        membership = gendata.parse_membership()
-        plan = plan_files(os_name, entries, notes, template, version,
-                          membership)
-        if not plan:
-            fatal("nothing to replicate from %s" % template)
-        log("modelling %s on %s (%d file(s))"
-            % (version, template, len(plan)))
+    plan = []
+    for job in jobs:
+        if job["action"] == "refresh":
+            items = plan_refresh(os_name, entries, job["version"])
+            if not items:
+                log("nothing to refresh after all for %s" % job["version"])
+                continue
+            log("refreshing %d conf(s) from RC to final %s media"
+                % (len(items), job["version"]))
+        else:
+            items = plan_files(os_name, entries, notes, job["template"],
+                               job["version"], membership)
+            if not items:
+                fatal("nothing to replicate from %s" % job["template"])
+            log("modelling %s on %s (%d file(s))"
+                % (job["version"], job["template"], len(items)))
+        job["items"] = items
+        plan.extend(items)
+    jobs = [j for j in jobs if j["items"]]
+    if not plan:
+        return 0
+
+    clash = check_plan_collisions(jobs)
+    if clash:
+        sys.stderr.write("watch: two upstream versions plan the same "
+                         "file, nothing written:\n")
+        for b in clash:
+            sys.stderr.write("  %s\n" % b)
+        return 1
 
     # The watcher workflow commits with `git add conf`, so anything written
     # elsewhere would be created on the runner, never committed, and leave
@@ -889,31 +1039,43 @@ def main(argv=None):
         with open(item["path"], "w", encoding="utf-8", newline="\n") as f:
             f.write(item["content"])
         log("wrote %s" % item["path"])
-    if action == "new":
+    landings = [j for j in jobs if j["action"] == "new"]
+    if landings:
         # Switch the landed tags ON in the hand-owned membership file --
         # without this the confs exist but never enter the build matrix.
-        new_tags = sorted(
-            (os.path.basename(p["path"])[len(os_name) + 1:-len(".conf")]
-             for p in plan if p["path"].endswith(".conf")),
-            key=gendata.natural_key)
         mode = membership_update_mode()
-        old_tags = ([e["tag"] for e in entries
-                     if gendata.base_release(e) == template
-                     and e["tag"] in set(membership or [])]
-                    if mode == "replace" else [])
-        if args.check:
-            log("would append to all.release.conf: %s"
-                % ", ".join('"%s"' % t for t in new_tags))
-            if old_tags:
+        added_tags, old_tags = [], []
+        for job in landings:
+            new_tags = sorted(
+                (os.path.basename(p["path"])[len(os_name) + 1:-len(".conf")]
+                 for p in job["items"] if p["path"].endswith(".conf")),
+                key=gendata.natural_key)
+            added_tags.extend(new_tags)
+            if mode == "replace":
+                old_tags.extend(
+                    e["tag"] for e in entries
+                    if gendata.base_release(e) == job["template"]
+                    and e["tag"] in set(membership or []))
+            if args.check:
+                log("would append to all.release.conf: %s"
+                    % ", ".join('"%s"' % t for t in new_tags))
+            else:
+                added = append_membership(new_tags)
+                if added:
+                    log("all.release.conf += %s"
+                        % ", ".join('"%s"' % t for t in added))
+        # Evictions run once, after every addition, and never touch a tag
+        # this run just added: with two landings on one template (or a
+        # template that is itself a fresh tag) a per-job removal could
+        # otherwise drop a release the same run had just switched on.
+        old_tags = [t for t in dict.fromkeys(old_tags)
+                    if t not in set(added_tags)]
+        if old_tags:
+            if args.check:
                 log("would remove from all.release.conf "
                     "(ALL_RELEASES_UPDATE=replace): %s"
                     % ", ".join('"%s"' % t for t in old_tags))
-        else:
-            added = append_membership(new_tags)
-            if added:
-                log("all.release.conf += %s"
-                    % ", ".join('"%s"' % t for t in added))
-            if old_tags:
+            else:
                 gone = remove_membership(old_tags)
                 if gone:
                     log("all.release.conf -= %s "
@@ -932,10 +1094,12 @@ def main(argv=None):
         # built green on 2026-08-01 and the maintainer never heard about
         # it, although cutting the builder release tag (the ONE remaining
         # human action) was now wanted. The workflow turns this file into
-        # a notification issue.
+        # a notification issue -- ONE LINE PER LANDED VERSION, so a run
+        # that lands two branches opens two issues.
         with open(args.landed_out, "w", encoding="utf-8",
                   newline="\n") as f:
-            f.write("%s %s\n" % (action, version))
+            for job in jobs:
+                f.write("%s %s\n" % (job["action"], job["version"]))
     return 0
 
 

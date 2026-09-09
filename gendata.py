@@ -161,6 +161,54 @@ def natural_key(s):
     return key
 
 
+def branch_key(release):
+    """The maintenance branch a release belongs to, as a comparable tuple.
+
+    A branch is the release with its LAST numeric component dropped, so
+    "14.4" and "14.5" share a branch while "15.1" does not; openEuler's
+    service-pack chains stay apart from each other and from the interim
+    line ("22.03-LTS-SP4" -> 22/03/LTS/SP, "24.03-LTS-SP1" ->
+    24/03/LTS/SP, "25.09" -> 25); haiku's "r1beta5"/"r1beta6" stay
+    together (-> r/1/beta) while a hypothetical "r2beta1" branches away;
+    and a single-token version (plan9's "11952", openindiana's "202604")
+    collapses to the empty branch, i.e. one line for the whole builder.
+
+    A release with no numeric component at all (nextbsd's "continuous")
+    is its own branch -- there is no version field that could move.
+
+    Two callers MUST agree on this rule or the watcher misbehaves:
+    hooks/upstream_check.py reports the newest upstream version PER
+    BRANCH, and watch.decide() picks each reported version's template
+    conf from the same branch. It lives here, beside natural_key, for
+    the same reason natural_key is never copied into a hook -- one
+    definition, imported by both, so it cannot drift.
+    """
+    key = natural_key(release)
+    for i in range(len(key) - 1, -1, -1):
+        if key[i][0] == 0:
+            return tuple(key[:i])
+    return tuple(key)
+
+
+def newest_per_branch(versions):
+    """The newest version of each branch in `versions`, natural-key order.
+
+    The shared reducer for the detection hooks. An upstream index that
+    carries several concurrent branches (FreeBSD 14.x beside 15.x,
+    NetBSD 9.x/10.x/11.x, openEuler's LTS service packs beside the
+    interim line) has to report one version per branch: reporting only
+    the single newest is what let FreeBSD 14.5-RELEASE -- published
+    2026-09-04, after 15.1 -- go undetected every night until it was
+    added by hand.
+    """
+    best = {}
+    for v in versions:
+        b = branch_key(v)
+        if b not in best or natural_key(v) > natural_key(best[b]):
+            best[b] = v
+    return sorted(best.values(), key=natural_key)
+
+
 def arch_rank(arch):
     if arch in CANON_ARCHES:
         return (CANON_ARCHES.index(arch), "")
