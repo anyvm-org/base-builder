@@ -24,6 +24,7 @@
 
 import argparse
 import difflib
+import fnmatch
 import json
 import os
 import re
@@ -300,6 +301,7 @@ def parse_notes():
         "release_label": None,
         "extra_columns": [],
         "extra_values": {},
+        "extra_patterns": [],
         "raw": "",
         "footnote_ids": set(),
         "shelved": set(),
@@ -345,7 +347,14 @@ def parse_notes():
                 if not notes["extra_columns"]:
                     fatal("notes: extra-value before any extra-column")
                 col = notes["extra_columns"][-1]
-                notes["extra_values"][(col, parts[0])] = parts[1]
+                # A key with a glob character ("*-build", "*") is a
+                # pattern, so a release the watcher lands -- it writes
+                # conf/ only, never this file -- still gets its cell
+                # instead of a dash. Patterns keep file order.
+                if any(c in parts[0] for c in "*?["):
+                    notes["extra_patterns"].append((col, parts[0], parts[1]))
+                else:
+                    notes["extra_values"][(col, parts[0])] = parts[1]
             elif key == "shelved":
                 notes["shelved"].add(val)
             elif key == "no-build":
@@ -382,12 +391,29 @@ def table_arches(entries):
     return ordered + sorted(a for a in present if a not in CANON_ARCHES)
 
 
+def extra_value(notes, col, rel):
+    """An exact extra-value wins; otherwise the FIRST matching pattern in
+    file order, so "*-build" listed before "*" decides a -build row."""
+    if (col, rel) in notes["extra_values"]:
+        return notes["extra_values"][(col, rel)]
+    for pcol, pat, val in notes["extra_patterns"]:
+        if pcol == col and fnmatch.fnmatchcase(rel, pat):
+            return val
+    return DASH
+
+
 def render_table(entries, notes):
     main = [e for e in entries if not e["desktop"]]
     arches = table_arches(entries)
     cells = dict(((e["release"], e["arch"]), e) for e in main)
     releases = sorted(set(e["release"] for e in main),
                       key=lambda r: (natural_key(r), r), reverse=True)
+    # a pattern that matches no row is a typo ("*-buld"), and would
+    # otherwise leave every cell it was meant for a silent dash
+    for pcol, pat, _ in notes["extra_patterns"]:
+        if not any(fnmatch.fnmatchcase(r, pat) for r in releases):
+            fatal("notes: extra-value pattern %r (column %s) matches no "
+                  "release" % (pat, pcol))
     cols = ([notes["release_label"] or "Release"]
             + notes["extra_columns"]
             + [notes["arch_labels"].get(a, a) for a in arches])
@@ -397,7 +423,7 @@ def render_table(entries, notes):
     for rel in releases:
         row = [rel]
         for col in notes["extra_columns"]:
-            row.append(notes["extra_values"].get((col, rel), DASH))
+            row.append(extra_value(notes, col, rel))
         for arch in arches:
             e = cells.get((rel, arch))
             combo = "%s-%s" % (rel, arch)

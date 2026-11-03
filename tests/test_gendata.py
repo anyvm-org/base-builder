@@ -241,6 +241,19 @@ class TestNotes(GendataCase):
         self.assertEqual(notes["extra_columns"], ["Android"])
         self.assertEqual(notes["extra_values"], {("Android", "16"): "13"})
 
+    def test_extra_value_patterns_keep_file_order(self):
+        write(gendata.NOTES_PATH,
+              "<!-- extra-column: Comments -->\n"
+              "<!-- extra-value: 202604 fresh -->\n"
+              "<!-- extra-value: *-build build-essential -->\n"
+              "<!-- extra-value: * fresh -->\n")
+        notes = gendata.parse_notes()
+        self.assertEqual(notes["extra_values"],
+                         {("Comments", "202604"): "fresh"})
+        self.assertEqual(notes["extra_patterns"],
+                         [("Comments", "*-build", "build-essential"),
+                          ("Comments", "*", "fresh")])
+
     def test_url_template_directive(self):
         write(gendata.NOTES_PATH,
               "<!-- url-template: VM_ISO_LINK = "
@@ -281,6 +294,41 @@ class TestRenderTable(GendataCase):
         self.assertIn("| aarch64(arm64) |".replace("aarch64(arm64)", "riscv64"),
                       out)
         self.assertTrue(out.endswith(NOTES_SAMPLE))
+
+    def test_extra_value_wildcards(self):
+        # A release the watcher lands has no hand-written row in the
+        # notes; a pattern still gives it the right cell. Exact beats
+        # pattern, and the first matching pattern wins.
+        for rel in ("202604", "202604-build", "202610", "202610-build",
+                    "202610-gcc"):
+            self.add("demo-%s.conf" % rel, conf_text("demo", rel))
+        write(gendata.NOTES_PATH,
+              "<!-- extra-column: Comments -->\n"
+              "<!-- extra-value: 202604 hand -->\n"
+              "<!-- extra-value: *-build build-essential -->\n"
+              "<!-- extra-value: 2026?? fresh -->\n"
+              "<!-- extra-column: EOL -->\n"
+              "<!-- extra-value: 202604 2027-04 -->\n")
+        entries = gendata.scan_confs()[1]
+        out = gendata.render_table(entries, gendata.parse_notes())
+        ok = "\u2705 (rsync,scp)"
+        self.assertIn("| 202610-build | build-essential | \u2014 | %s |" % ok,
+                      out)
+        self.assertIn("| 202610 | fresh | \u2014 | %s |" % ok, out)
+        self.assertIn("| 202610-gcc | \u2014 | \u2014 | %s |" % ok, out)
+        self.assertIn("| 202604-build | build-essential | \u2014 | %s |" % ok,
+                      out)
+        self.assertIn("| 202604 | hand | 2027-04 | %s |" % ok, out)
+
+    def test_extra_value_pattern_matching_nothing_is_fatal(self):
+        # a typo such as "*-buld" would otherwise leave every cell a dash
+        self.add("demo-202604-build.conf", conf_text("demo", "202604-build"))
+        write(gendata.NOTES_PATH,
+              "<!-- extra-column: Comments -->\n"
+              "<!-- extra-value: *-buld build-essential -->\n")
+        entries = gendata.scan_confs()[1]
+        with self.assertRaises(SystemExit):
+            gendata.render_table(entries, gendata.parse_notes())
 
     def test_desktop_confs_excluded_from_main_table(self):
         self.add("demo-15.0.conf", conf_text("demo", "15.0"))
