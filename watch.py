@@ -799,15 +799,24 @@ class UrlError(Exception):
     pass
 
 
+# The same agent every hooks/upstream_check.py sends. Never urllib's
+# default "Python-urllib/3.x": dlc.openindiana.org (Cloudflare) answers
+# 403 to it on every path, HEAD and GET alike, which refused the
+# openindiana 202610 landing although the ISO was there.
+USER_AGENT = "anyvm-org-upstream-watcher/1.0"
+
+
 def _head(url):
-    req = urllib.request.Request(url, method="HEAD")
+    req = urllib.request.Request(url, method="HEAD",
+                                 headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status
     except urllib.error.HTTPError as e:
         # some mirrors reject HEAD outright -- retry as a 1-byte GET
         if e.code in (403, 405, 501):
-            req = urllib.request.Request(url)
+            req = urllib.request.Request(url,
+                                         headers={"User-Agent": USER_AGENT})
             req.add_header("Range", "bytes=0-0")
             try:
                 with urllib.request.urlopen(req, timeout=30) as r:

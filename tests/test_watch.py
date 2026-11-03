@@ -944,6 +944,57 @@ class TestUrlRetry(unittest.TestCase):
         self.assertEqual(op.calls, 3)
 
 
+class FakeResponse(object):
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestHeadUserAgent(unittest.TestCase):
+    """The real _head() must not announce itself as Python-urllib.
+
+    dlc.openindiana.org (Cloudflare) answers 403 to that User-Agent on
+    every path, HEAD and GET alike, so the openindiana 202610 landing
+    was refused although the ISO was there.
+    """
+
+    def setUp(self):
+        self.reqs = []
+        real = watch.urllib.request.urlopen
+        self.addCleanup(setattr, watch.urllib.request, "urlopen", real)
+        watch.urllib.request.urlopen = self.fake
+
+    def fake(self, req, timeout=None):
+        self.reqs.append(req)
+        if req.get_method() == "HEAD" and self.head_code >= 400:
+            raise watch.urllib.error.HTTPError(
+                req.full_url, self.head_code, "Forbidden", {}, None)
+        return FakeResponse(206 if req.get_method() == "GET" else 200)
+
+    def assert_agent(self, req):
+        agent = req.get_header("User-agent")
+        self.assertTrue(agent)
+        self.assertFalse(agent.startswith("Python-urllib"))
+
+    def test_head_sends_user_agent(self):
+        self.head_code = 200
+        self.assertEqual(watch._head("https://x/a.iso"), 200)
+        self.assertEqual([r.get_method() for r in self.reqs], ["HEAD"])
+        self.assert_agent(self.reqs[0])
+
+    def test_get_fallback_sends_user_agent(self):
+        self.head_code = 403
+        self.assertEqual(watch._head("https://x/a.iso"), 206)
+        self.assertEqual([r.get_method() for r in self.reqs],
+                         ["HEAD", "GET"])
+        self.assert_agent(self.reqs[1])
+
+
 class TestCompanionGuard(unittest.TestCase):
     def _item(self, name, key, leftovers=()):
         return {"path": os.path.join("conf", name), "source": "conf/old",
