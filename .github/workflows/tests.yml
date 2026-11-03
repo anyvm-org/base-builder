@@ -9,12 +9,16 @@ on:
     branches:
       - main
     paths:
+      - 'build.py'
       - 'gendata.py'
+      - 'watch.py'
       - 'tests/**'
       - '.github/workflows/tests.yml'
   pull_request:
     paths:
+      - 'build.py'
       - 'gendata.py'
+      - 'watch.py'
       - 'tests/**'
 
 jobs:
@@ -22,5 +26,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Run gendata tests
+      - name: Run unit tests
         run: python3 -m unittest discover -s tests -v
