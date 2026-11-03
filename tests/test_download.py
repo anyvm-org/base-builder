@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import build
@@ -20,18 +21,45 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
       "drop-half"  answer, but close after half the body
       "ignore-drop-half"  both
       "wrong-range" answer 206 with the right length from byte 0
+      "error-<code>" answer that status with no body (524/525: Cloudflare
+                   could not reach dlc.openindiana.org)
+    server.fail_next holds status codes for the next requests the script
+    does not name, the size probe ("bytes=0-0") excepted.
+    server.reject_range answers 416 to every request carrying Range, and
+    server.head_ok makes HEAD report the size (no Accept-Ranges).
     """
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):
         pass
 
+    def do_HEAD(self):
+        if not self.server.head_ok:
+            self.send_error(501)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(self.server.payload)))
+        self.end_headers()
+
     def do_GET(self):
         srv = self.server
         rng = self.headers.get("Range")
         srv.requests.append(rng)
         data = srv.payload
-        action = srv.script.pop(rng, srv.fallback) or ""
+        if rng and srv.reject_range:
+            self.send_response(416)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        action = srv.script.pop(rng, None)
+        if action is None and rng != "bytes=0-0" and srv.fail_next:
+            action = "error-%d" % srv.fail_next.pop(0)
+        action = action or srv.fallback or ""
+        if action.startswith("error-"):
+            self.send_response(int(action[len("error-"):]))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if rng and not action.startswith("ignore"):
             m = re.match(r"bytes=(\d+)-(\d*)$", rng)
             first = int(m.group(1))
@@ -70,6 +98,9 @@ class DownloadCase(unittest.TestCase):
         self.srv.payload = random.Random(1).randbytes(self.SIZE)
         self.srv.script = {}
         self.srv.fallback = None
+        self.srv.fail_next = []
+        self.srv.reject_range = False
+        self.srv.head_ok = False
         self.srv.requests = []
         t = threading.Thread(target=self.srv.serve_forever, daemon=True)
         t.start()
@@ -145,6 +176,71 @@ class TestRangeIgnored(DownloadCase):
     def test_plain_ranged_download(self):
         self.assertEqual(build.download(self.url, self.path), 0)
         self.assertTrue(self.content() == self.srv.payload)
+
+
+class TestServerErrors(DownloadCase):
+    """openindiana 202604 / 202604-build: the probe found no usable Range,
+    and the single stream died on its first 524 / 525."""
+
+    def test_unranged_download_outlasts_server_errors(self):
+        # probe answered 200: size known, no ranges
+        self.srv.script["bytes=0-0"] = "ignore"
+        self.srv.fail_next = [524, 525, 524]
+        self.assertEqual(build.download(self.url, self.path), 0)
+        self.assertTrue(self.content() == self.srv.payload)
+
+    def test_unknown_size_download_outlasts_server_errors(self):
+        # probe itself failed: size unknown, plain GET
+        self.srv.script["bytes=0-0"] = "error-524"
+        self.srv.fail_next = [525]
+        self.assertEqual(build.download(self.url, self.path), 0)
+        self.assertTrue(self.content() == self.srv.payload)
+
+    def test_persistent_server_error_gives_up(self):
+        self.srv.script["bytes=0-0"] = "error-524"
+        self.srv.fallback = "error-524"
+        with self.assertRaises(SystemExit):
+            build.download(self.url, self.path)
+        self.assertEqual(len(self.srv.requests),
+                         1 + len(build.DL_RETRY_WAITS) + 1)
+
+    def test_not_found_is_not_retried(self):
+        self.srv.script["bytes=0-0"] = "error-404"
+        self.srv.fallback = "error-404"
+        with self.assertRaises(SystemExit):
+            build.download(self.url, self.path)
+        self.assertEqual(self.srv.requests, ["bytes=0-0", None])
+
+    def test_range_rejected_but_plain_get_works(self):
+        # size from HEAD, no usable Range: a plain GET, as before
+        self.srv.reject_range = True
+        self.srv.head_ok = True
+        self.assertEqual(build.download(self.url, self.path), 0)
+        self.assertTrue(self.content() == self.srv.payload)
+        self.assertEqual(self.srv.requests, ["bytes=0-0", None])
+
+    def test_short_plain_download_is_retried(self):
+        # a stream that just ends early raises nothing in http.client
+        self.srv.script["bytes=0-0"] = "ignore"
+        self.srv.script[None] = "drop-half"
+        self.assertEqual(build.download(self.url, self.path), 0)
+        self.assertTrue(self.content() == self.srv.payload)
+
+    def test_resume_not_found_is_not_retried(self):
+        # every chunk 404s, so the resume fallback runs: one 404 there
+        # is final, not three stalls times four attempts
+        self.srv.script["bytes=0-0"] = "ok"
+        self.srv.fallback = "error-404"
+        with self.assertRaises(SystemExit):
+            build.download(self.url, self.path)
+        self.assertEqual(self.srv.requests.count("bytes=0-"), 1)
+
+    def test_only_missing_urls_are_final(self):
+        # 402 is how archive.netbsd.org throttles a stream mid-transfer
+        for code in (402, 403, 408, 416, 429, 500, 524, 525, 404, 410):
+            err = urllib.error.HTTPError(self.url, code, "x", {}, None)
+            self.assertEqual(build._dl_transient(err),
+                             code not in (404, 410), code)
 
 
 if __name__ == "__main__":
