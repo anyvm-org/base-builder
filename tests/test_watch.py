@@ -473,6 +473,16 @@ class TestRefresh(WatchCase):
         self.assertEqual(watch.decide(os_name, entries, notes, "11.0"),
                          ("refresh", "11.0"))
 
+    def test_lower_case_rc_is_refreshed_too(self):
+        # hyprbsd's shape: VM_RELEASE=15.1, media hyprbsd-15.1-rc3.iso
+        rc_url = "https://x/hyprbsd-15.1-rc3.iso"
+        self.add("demo-15.1.conf", conf_text("demo", "15.1", url=rc_url))
+        os_name, entries, notes = self._load()
+        self.assertEqual(watch.decide(os_name, entries, notes, "15.1"),
+                         ("refresh", "15.1"))
+        plan = watch.plan_refresh(os_name, entries, "15.1")
+        self.assertEqual(plan[0]["urls"], ["https://x/hyprbsd-15.1.iso"])
+
     def test_decide_is_noop_once_urls_are_final(self):
         self.add("demo-11.0.conf",
                  conf_text("demo", "11.0", url=self.FINAL_URL))

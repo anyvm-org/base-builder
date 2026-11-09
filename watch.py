@@ -215,8 +215,9 @@ def pick_template(version, live):
 
 def _rc_token_re(version):
     """The version pinned to release-candidate media: '11.0_RC7' or
-    '11.0-RC7' style, exactly for this version."""
-    return re.compile(re.escape(version) + r"[_-]RC\d+")
+    '11.0-RC7' style, exactly for this version. The RC itself may be lower
+    case: netbsd spells it 'RC7', hyprbsd 'rc3' (hyprbsd-15.1-rc3.iso)."""
+    return re.compile(re.escape(version) + r"[_-][Rr][Cc]\d+")
 
 
 def _conf_urls(os_name, tag):
