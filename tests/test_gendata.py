@@ -281,6 +281,20 @@ class TestRenderTable(GendataCase):
             "| 14.4 | \u2705 (rsync,scp) | \u2705 (nfs,scp) |\n"
             "\n")
 
+    def test_variants_follow_their_release(self):
+        # "15.1-ufs" has the larger natural key, but the default image
+        # heads its group; chained variants group under the bottom release.
+        for rel in ("15.0", "15.0-ufs", "15.1", "15.1-ufs", "14.5",
+                    "11.4", "11.4-gcc", "11.4-gcc-14", "11.4-clang-19"):
+            self.add("demo-%s.conf" % rel, conf_text("demo", rel))
+        entries = gendata.scan_confs()[1]
+        out = gendata.render_table(entries, gendata.parse_notes())
+        rows = [l.split(" | ")[0][2:] for l in out.splitlines()
+                if l.startswith("| ") and not l.startswith("| Release")]
+        self.assertEqual(rows, ["15.1", "15.1-ufs", "15.0", "15.0-ufs",
+                                "14.5", "11.4", "11.4-clang-19", "11.4-gcc",
+                                "11.4-gcc-14"])
+
     def test_absent_footnote_and_notes_appended(self):
         self.add("demo-13.4.conf", conf_text("demo", "13.4"))
         self.add("demo-13.5.conf", conf_text("demo", "13.5"))

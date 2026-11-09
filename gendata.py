@@ -402,12 +402,37 @@ def extra_value(notes, col, rel):
     return DASH
 
 
+def table_release_order(releases):
+    """Main-table row order: newest release first, each release directly
+    followed by its variants.
+
+    A variant is a release that is another release plus "-<suffix>"
+    ("15.1-ufs", "r151058-build", "11.4-gcc-14") -- the rule watch.py's
+    real_bases() uses. Plain natural-key order would put "15.1-ufs" ABOVE
+    "15.1" (a longer key sorts higher), so the default image would read as
+    the afterthought. Instead the release a variant chain bottoms out at
+    ("11.4" for "11.4-gcc-14") heads its group, and the variants follow in
+    ascending natural-key order.
+    """
+    rels = set(releases)
+    groups = {}
+    for r in rels:
+        roots = [o for o in rels if o != r and r.startswith(o + "-")]
+        root = min(roots, key=len) if roots else r
+        groups.setdefault(root, []).append(r)
+    ordered = []
+    for root in sorted(groups, key=lambda r: (natural_key(r), r),
+                       reverse=True):
+        ordered.extend(sorted(groups[root],
+                              key=lambda r: (r != root, natural_key(r), r)))
+    return ordered
+
+
 def render_table(entries, notes):
     main = [e for e in entries if not e["desktop"]]
     arches = table_arches(entries)
     cells = dict(((e["release"], e["arch"]), e) for e in main)
-    releases = sorted(set(e["release"] for e in main),
-                      key=lambda r: (natural_key(r), r), reverse=True)
+    releases = table_release_order(e["release"] for e in main)
     # a pattern that matches no row is a typo ("*-buld"), and would
     # otherwise leave every cell it was meant for a silent dash
     for pcol, pat, _ in notes["extra_patterns"]:
