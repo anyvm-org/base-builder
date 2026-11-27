@@ -406,8 +406,24 @@ class TestRenderDesktop(GendataCase):
             "\n"
             "| Release | x86_64 |\n"
             "|---------|---------|\n"
-            "| 15.1-xfce | \u2705 |\n"
+            "| 15.1-xfce | \u2705 (rsync,scp) |\n"
             "\n")
+
+    def test_desktop_cells_follow_the_main_table(self):
+        # sync methods per arch, a bare check without VM_SYNC_METHODS, and
+        # a dash for an arch the variant does not build.
+        self.add("demo-15.1-xfce.conf",
+                 conf_text("demo", "15.1-xfce", extra="hooks/xfce.sh",
+                           sync="rsync,nfs"))
+        self.add("demo-15.1-xfce-aarch64.conf",
+                 conf_text("demo", "15.1-xfce", arch="aarch64",
+                           extra="hooks/xfce.sh", sync=""))
+        self.add("demo-15.0-xfce.conf",
+                 conf_text("demo", "15.0-xfce", extra="hooks/xfce.sh"))
+        os_name, entries = gendata.scan_confs()
+        out = gendata.render_desktop(os_name, entries, gendata.parse_notes())
+        self.assertIn("| 15.1-xfce | \u2705 (rsync,nfs) | \u2705 |\n", out)
+        self.assertIn("| 15.0-xfce | \u2705 (rsync,scp) | \u2014 |\n", out)
 
     def test_desktop_notes_appended(self):
         self.add("demo-15.1-xfce.conf",

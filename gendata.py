@@ -513,7 +513,16 @@ def render_desktop(os_name, entries, notes):
     for tag in tags:
         row = [tag]
         for arch in arches:
-            row.append(CHECK if (tag, arch) in cells else DASH)
+            # Same cell as the main table: the conf's sync methods after
+            # the check mark, so a desktop image advertises them too.
+            e = cells.get((tag, arch))
+            if e is None:
+                row.append(DASH)
+            elif e["sync"]:
+                row.append("%s (%s)" % (CHECK, e["sync"]))
+            else:
+                warn("%s: VM_SYNC_METHODS empty" % e["tag"])
+                row.append(CHECK)
         lines.append("| " + " | ".join(row) + " |")
     lines.append("")
     text = "\n".join(lines) + "\n"
