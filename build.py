@@ -3598,6 +3598,10 @@ def run_hook(name):
                                is not guaranteed to have Python. Runs FIRST
                                so a host hook can build on the configured
                                guest (e.g. reboot it / rearrange disks).
+                               Bounded by GUEST_HOOK_MAX_SECONDS (conf
+                               override VM_GUEST_HOOK_MAX_SECONDS): running
+                               past it fails the build. Its exit status is
+                               logged, not checked.
 
       hooks/host_<name>.py  -- host-side, exec()'d into THIS module's globals.
                                The hook can call build.py functions directly
@@ -3626,11 +3630,23 @@ def run_hook(name):
         log(vm_sh)
         with open(vm_sh) as f:
             log(f.read())
+        limit = int(env("VM_GUEST_HOOK_MAX_SECONDS")
+                    or GUEST_HOOK_MAX_SECONDS.get(name,
+                                                  GUEST_HOOK_DEFAULT_MAX_SECONDS))
         with open(vm_sh, "rb") as f:
-            subprocess.run(
+            r = _ssh_run(
                 ["ssh", "-o", "SendEnv=VM_RELEASE",
                  globals().get("osname") or env("VM_OS_NAME"), "sh"],
-                stdin=f)
+                timeout=limit, stdin=f)
+        if getattr(r, "timed_out", False):
+            log("FATAL: guest hook %s did not finish within %d s "
+                "(VM_GUEST_HOOK_MAX_SECONDS); the guest is wedged"
+                % (vm_sh, limit))
+            sys.exit(1)
+        if r.returncode != 0:
+            # Not fatal: a guest hook's exit status was never checked
+            # before, so no green build shows which hooks exit nonzero.
+            log("guest hook %s exited %d" % (vm_sh, r.returncode))
         ran = True
     py = "hooks/host_%s.py" % name
     host_sh = "hooks/host_%s.sh" % name
@@ -3890,9 +3906,26 @@ def _ssh_run(argv, timeout=None, **kw):
     except subprocess.TimeoutExpired as exc:
         log("ssh command exceeded %d s and was killed: %s"
             % (timeout, " ".join(argv[1:]) or "(no command)"))
-        return subprocess.CompletedProcess(argv, 124,
-                                           exc.stdout or b"",
-                                           exc.stderr or b"")
+        cp = subprocess.CompletedProcess(argv, 124,
+                                         exc.stdout or b"",
+                                         exc.stderr or b"")
+        # rc 124 alone cannot tell this apart from a guest command that
+        # itself exits 124 (e.g. its own `timeout`).
+        cp.timed_out = True
+        return cp
+
+
+# Wall-clock ceilings for the in-guest scripts build.py pipes over ssh.
+# Crash backstops, >= 3x the slowest green run in the fleet's last three
+# Build runs (591 jobs, 2026-11-28): vm_postBuild.sh 1699 s (openindiana
+# 202604-build), vm_finalize.sh 894 s (openeuler 25.09-riscv64),
+# VM_EXTRA_SCRIPT 724 s (openbsd 8.0-kde6). Unbounded, a wedged
+# openbsd 7.9-sparc64 guest held vm_finalize.sh -- ~10 s when healthy --
+# for 5 h 40 m until GitHub cancelled the job (run 46105157848), and a
+# cancelled job is not retried by rerun.yml.
+GUEST_HOOK_MAX_SECONDS = {"postBuild": 5400, "finalize": 2700}
+GUEST_HOOK_DEFAULT_MAX_SECONDS = 5400
+EXTRA_SCRIPT_MAX_SECONDS = 2700
 
 
 def _ssh_ready_check(timeout=None):
@@ -4434,16 +4467,20 @@ def _enable_ssh_console_branch():
 def _send_env_check():
     """sanity-check that ssh SendEnv passes GITHUB_ANYVM through."""
     osname = env("VM_OS_NAME")
-    p = subprocess.run(
+    p = _ssh_run(
         ["ssh", osname, "sh", "-c", "env"], capture_output=True,
         env={**os.environ, "GITHUB_ANYVM": "1"})
+    if getattr(p, "timed_out", False):
+        log("SendEnv check: the guest did not answer; skipping the guest "
+            "diagnostics")
+        return False
     if b"GITHUB_" in p.stdout:
         log("SendEnv OK"); return True
     log("SendEnv is not working")
     log("===============env====")
     sh("env")
     log("=============ssh env==")
-    subprocess.call(["ssh", osname, "sh", "-c", "env"])
+    _ssh_run(["ssh", osname, "sh", "-c", "env"])
     log("=========check data===")
     sh("pwd; ls -lah .; ls -lah ~; ls -lah ~/.ssh")
     if os.path.exists(os.path.expanduser("~/.ssh/config")):
@@ -4451,11 +4488,43 @@ def _send_env_check():
     if os.path.exists(os.path.expanduser("~/.ssh/config.d")):
         sh("cat ~/.ssh/config.d/*")
     log("====== check data in vm====")
-    subprocess.call(["ssh", osname, "ls -lah"])
-    subprocess.call(["ssh", osname, "ls -lah .ssh"])
-    subprocess.call(["ssh", osname, "cat .ssh/*"])
-    subprocess.call(["ssh", osname, "cat /etc/ssh/sshd_config"])
+    _ssh_run(["ssh", osname, "ls -lah"])
+    _ssh_run(["ssh", osname, "ls -lah .ssh"])
+    _ssh_run(["ssh", osname, "cat .ssh/*"])
+    _ssh_run(["ssh", osname, "cat /etc/ssh/sshd_config"])
     return False
+
+
+def _run_extra_script(path, osname):
+    """Pipe VM_EXTRA_SCRIPT into the guest's sh and return its exit status:
+    124 when it ran past EXTRA_SCRIPT_MAX_SECONDS (conf override
+    VM_EXTRA_SCRIPT_MAX_SECONDS) and was killed. The relaxed keepalive keeps
+    a long CPU burst in the guest from dropping the connection."""
+    limit = int(env("VM_EXTRA_SCRIPT_MAX_SECONDS") or EXTRA_SCRIPT_MAX_SECONDS)
+    with open(path, "rb") as f:
+        return _ssh_run(["ssh", "-o", "SendEnv=VM_RELEASE",
+                         "-o", "ServerAliveInterval=30",
+                         "-o", "ServerAliveCountMax=20",
+                         osname, "sh"], timeout=limit, stdin=f).returncode
+
+
+def _show_guest_home(osname):
+    """Create ~/work in the verification guest and show its home directory
+    and sshd_config (haiku keeps both in its own places). Returns False as
+    soon as one command runs past its ceiling (the guest is wedged); other
+    exit codes are only shown."""
+    if osname == "haiku":
+        cmds = ["mkdir -p '$HOME/work'", "ls -lah '$HOME'"]
+        sshd_config = "/boot/system/settings/ssh/sshd_config"
+    else:
+        cmds = ["mkdir -p $HOME/work", "ls -lah $HOME"]
+        sshd_config = "/etc/ssh/sshd_config"
+    for c in cmds:
+        if getattr(_ssh_run(["ssh", osname, c]), "timed_out", False):
+            return False
+    log("======Show ssh config: ")
+    r = _ssh_run(["ssh", osname, "cat " + sshd_config])
+    return not getattr(r, "timed_out", False)
 
 
 def main(argv):
@@ -4687,6 +4756,11 @@ def main(argv):
         # "Connection ... closed by remote host", rc=255). Reboot once and
         # retry; a deterministic failure (a package that genuinely cannot
         # install) still fails the build on the second attempt.
+        #
+        # No wall-clock ceiling: green installs take up to 6343 s (openeuler
+        # 22.03-LTS-SP4-aarch64, run 45938579484). A 3x bound (about 5.3 h)
+        # would leave the retry below no time before GitHub's 6 h job
+        # limit, which already caps this step.
         inst_ok = False
         for inst_attempt in (1, 2):
             rc = subprocess.run(["ssh", "-o", "ServerAliveInterval=30",
@@ -4725,12 +4799,9 @@ def main(argv):
         # desktop, yet the build still went green and was published. Fail the
         # build on any non-zero rc so a desktop-less image is never shipped.
         # One failure is a failure -- no retry; rerun the job to recover from a
-        # transient repo-catalogue hiccup.
-        with open(extra, "rb") as f:
-            rc = subprocess.run(["ssh", "-o", "SendEnv=VM_RELEASE",
-                                 "-o", "ServerAliveInterval=30",
-                                 "-o", "ServerAliveCountMax=20",
-                                 osname, "sh"], stdin=f).returncode
+        # transient repo-catalogue hiccup. A script that runs past
+        # EXTRA_SCRIPT_MAX_SECONDS is killed and fails the same way (rc 124).
+        rc = _run_extra_script(extra, osname)
         if rc != 0:
             log("VM_EXTRA_SCRIPT %s FAILED rc=%d; aborting (refusing to ship "
                 "an image whose extra script did not complete)" % (extra, rc))
@@ -4902,16 +4973,9 @@ def main(argv):
             return 1
         if not _send_env_check():
             return 1
-        if osname == "haiku":
-            subprocess.call(["ssh", osname, "mkdir -p '$HOME/work'"])
-            subprocess.call(["ssh", osname, "ls -lah '$HOME'"])
-            log("======Show ssh config: ")
-            subprocess.call(["ssh", osname, "cat /boot/system/settings/ssh/sshd_config"])
-        else:
-            subprocess.call(["ssh", osname, "mkdir -p $HOME/work"])
-            subprocess.call(["ssh", osname, "ls -lah $HOME"])
-            log("======Show ssh config: ")
-            subprocess.call(["ssh", osname, "cat /etc/ssh/sshd_config"])
+        if not _show_guest_home(osname):
+            log("verification FAILED: the guest stopped answering ssh")
+            return 1
 
         # Actually RUN rsync in the guest -- do not merely name the package.
         # This block used to log "Checking the packages: <names>" and then
