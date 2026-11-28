@@ -489,6 +489,18 @@ def host_nested_amd_with_avx512():
 
 
 def qemu_accel():
+    # VM_ACCEL pins the accelerator (kvm / hvf / tcg) instead of the host-aware
+    # pick below. Meant for debugging a guest that misbehaves under one
+    # accelerator (libernt BSODs under nested AMD KVM in WSL2 while TCG and
+    # WHPX boot it fine) -- set it in the environment for a local run, or in
+    # a conf when a guest must never use hardware acceleration. An unknown
+    # value is fatal rather than silently falling back.
+    forced = env("VM_ACCEL")
+    if forced:
+        if forced not in ("kvm", "hvf", "tcg"):
+            log("FATAL: VM_ACCEL=%s is not one of kvm, hvf, tcg" % forced)
+            sys.exit(1)
+        return forced
     a = env("VM_ARCH") or "x86_64"
     if a in ("riscv64", "s390x", "loongarch64"):
         return "tcg"
@@ -1010,7 +1022,9 @@ def build_qemu_args(media_kind=None, media_path=None):
     # Haiku, Windows and ReactOS (an NT reimplementation, same convention)
     # read the RTC as local time, not UTC; using UTC there offsets the wall
     # clock by the timezone (TLS / cert breakage). Mirrors anyvm.py:5173-5176.
-    rtc_base = ("localtime" if osname in ("windows", "reactos", "haiku")
+    # LiberNT is a ReactOS fork and follows the same NT convention.
+    rtc_base = ("localtime" if osname in ("windows", "reactos", "libernt",
+                                          "haiku")
                 else "utc")
     # ReactOS is the one guest that must NOT get driftfix. Its HAL sizes every
     # busy-wait from the loop iterations counted between two RTC (IRQ8)
@@ -1030,8 +1044,10 @@ def build_qemu_args(media_kind=None, media_path=None):
     # calibrates its own delay loops from timer interrupts. Every boot that
     # has been verified for this guest ran without driftfix, so do not start
     # adding it on the strength of it "probably being a no-op".
+    # LiberNT is a ReactOS fork with the same HAL lineage, and every boot
+    # verified for it (TCG, WHPX) ran without driftfix -- keep it that way.
     rtc_opts = ("base=%s,clock=host" % rtc_base
-                if osname in ("reactos", "riscos")
+                if osname in ("reactos", "libernt", "riscos")
                 else "base=%s,clock=host,driftfix=slew" % rtc_base)
     # VM_MEMORY honours per-conf overrides; the default 6144 covers the
     # bulk of guests. RISC-V virt machines place the FDT blob near the top
@@ -1071,8 +1087,10 @@ def build_qemu_args(media_kind=None, media_path=None):
     # CCW bus (its branch adds virtio-rng-ccw instead). Mirrors anyvm.py:5627.
     # armv7 (raspi2b) is excluded for a blunter reason than the others: the
     # Raspberry Pi has no PCI bus at all, so QEMU aborts at launch rather than
-    # merely confusing the guest.
-    if (osname not in ("solaris", "reactos")
+    # merely confusing the guest. LiberNT (a ReactOS fork) inherits the same
+    # New Hardware Wizard, and every boot verified for it ran without the
+    # device, so it is skipped there too.
+    if (osname not in ("solaris", "reactos", "libernt")
             and arch not in ("sparc64", "s390x", "armv7")):
         a += ["-object", "rng-builtin,id=rng0",
               "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=1000"]
@@ -1140,16 +1158,25 @@ def build_qemu_args(media_kind=None, media_path=None):
             vga = "virtio-gpu-pci"
         a += ["-device", vga]
         a += ["-drive", "file=%s,format=qcow2,if=none,id=disk0,discard=unmap,detect-zeroes=unmap" % qcow]
+        # Main disk device. virtio-blk unless the conf asks for NVMe
+        # (VM_DISK=nvme): LiberNT's arm64 build has no virtio-blk driver --
+        # on virtio-blk its kernel bug-checks in IopMarkBootPartition -- but
+        # ships stornvme.sys and boots from an NVMe disk. The serial is
+        # required by QEMU's nvme device.
+        if dif == "nvme":
+            disk_dev = "nvme,drive=disk0,serial=anyvm-disk0"
+        else:
+            disk_dev = "virtio-blk-pci,drive=disk0"
         if media_kind == "disk":
             a += ["-drive", "file=%s,format=raw,if=none,id=inst0" % media_path]
             a += ["-device", "virtio-blk-pci,drive=inst0,bootindex=0"]
-            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=1"]
+            a += ["-device", "%s,bootindex=1" % disk_dev]
         elif media_kind == "cdrom":
             a += ["-drive", "file=%s,format=raw,if=none,id=inst0,media=cdrom" % media_path]
             a += ["-device", "usb-storage,drive=inst0,bootindex=0"]
-            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=1"]
+            a += ["-device", "%s,bootindex=1" % disk_dev]
         else:
-            a += ["-device", "virtio-blk-pci,drive=disk0,bootindex=0"]
+            a += ["-device", "%s,bootindex=0" % disk_dev]
         if not console:
             a += ["-device", "usb-kbd", "-device", "virtio-tablet-pci"]
 
@@ -1509,8 +1536,8 @@ def build_qemu_args(media_kind=None, media_path=None):
         # ReactOS has no virtio-balloon driver, and an unclaimed PCI device
         # makes it pop a modal "New Hardware Wizard" over the desktop that an
         # unattended build has nobody to dismiss. Same reasoning as the
-        # virtio-rng skip above.
-        if osname != "reactos":
+        # virtio-rng skip above (and the same for its fork, LiberNT).
+        if osname not in ("reactos", "libernt"):
             a += ["-device", "virtio-balloon-pci"]
         # CDROM / disk IDE-slot placement -- two layouts depending on whether
         # the main disk itself sits on the IDE bus.
@@ -1703,7 +1730,7 @@ def _profile_rng():
         # microvm has no PCI bus; the rng rides the MMIO virtio transport
         # (virtio-rng-device). Verified attaching as viornd0 on netbsd 11.0.
         return "mmio"
-    if (env("VM_OS_NAME") in ("solaris", "reactos")
+    if (env("VM_OS_NAME") in ("solaris", "reactos", "libernt")
             or arch in ("sparc64", "armv7")):
         # armv7 is raspi2b, which has no PCI bus at all -- QEMU aborts at
         # launch rather than merely leaving the device unclaimed.
@@ -1752,9 +1779,9 @@ def _profile_balloon():
         # No PCI bus on microvm, so no virtio-balloon-pci (and no MMIO
         # balloon is attached either -- keep the device set minimal).
         return False
-    if env("VM_OS_NAME") == "reactos":
+    if env("VM_OS_NAME") in ("reactos", "libernt"):
         # No virtio-balloon driver; an unclaimed PCI device raises a modal
-        # New Hardware Wizard over the desktop.
+        # New Hardware Wizard over the desktop (LiberNT is a ReactOS fork).
         return False
     if arch in ("x86_64", "i386"):
         # i386 (hurd) runs through the same PC-class else-branch of
@@ -1833,6 +1860,14 @@ def build_guest_profile():
         cpu_cap = 1
         if arch == "i386":
             mem_cap = 2048
+    if osname == "libernt" and arch in ("", "x86_64"):
+        # LiberNT's HAL bug-checks in HalAllocateAdapterChannel (NULL
+        # spinlock in the map-register path) as soon as a 32-bit DMA device
+        # -- its e1000 or UHCI driver -- gets a buffer above 4 GB. On the
+        # `pc` machine RAM stays below the 4 GB line only up to 3.5 GB;
+        # measured 2026-11-28 under TCG: 2048 and 3072 MB boot, 3584 MB
+        # bug-checks every time. The conf's VM_MEMORY honours the same cap.
+        mem_cap = 3072
     profile = {
         "anyvm_profile_version": GUEST_PROFILE_VERSION,
         "os": osname,
@@ -1850,10 +1885,11 @@ def build_guest_profile():
         "firmware_kind": _profile_firmware_kind(),
         "qemu_min_version": _profile_qemu_min_version(),
         "balloon": _profile_balloon(),
-        # RTC epoch the guest expects: windows/reactos/haiku read the CMOS
-        # clock as local time, everything else as UTC. Mirrors
+        # RTC epoch the guest expects: windows/reactos/libernt/haiku read the
+        # CMOS clock as local time, everything else as UTC. Mirrors
         # build_qemu_args()'s rtc_base and anyvm.py's.
-        "rtc_base": ("localtime" if osname in ("windows", "reactos", "haiku")
+        "rtc_base": ("localtime" if osname in ("windows", "reactos",
+                                               "libernt", "haiku")
                      else "utc"),
         "console": bool(env("VM_USE_CONSOLE_BUILD")),
         # Remote-exec channel into the guest: "ssh" for everything except
@@ -2558,7 +2594,15 @@ def createVMFromVHD(sshport=None):
     osname = _check_osname("createVMFromVHD")
     if not osname: return 1
     vhd = wf("%s.qcow2" % osname)
-    must_run(["qemu-img", "resize", vhd, "+200G"], "qemu-img resize")
+    # VM_VHD_NO_RESIZE: the builder's prepareImage hook already grew the disk
+    # AND the partition/filesystem on it (libernt: its 1 GiB NTFS image is
+    # grown offline with ntfsresize before the first boot). Growing the
+    # virtual disk again here would only leave an unpartitioned tail.
+    if env("VM_VHD_NO_RESIZE"):
+        log("createVMFromVHD: VM_VHD_NO_RESIZE set, keeping %s as prepared"
+            % vhd)
+    else:
+        must_run(["qemu-img", "resize", vhd, "+200G"], "qemu-img resize")
     write_state(osname, "sshport", sshport or "22")
     log("createVMFromVHD: %s prepared (sshport=%s). startVM will boot it."
         % (vhd, sshport))
